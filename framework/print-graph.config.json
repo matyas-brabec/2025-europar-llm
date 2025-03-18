@@ -1,0 +1,218 @@
+{
+    "gol": {
+        "title": "Game of Life",
+        "class_ids_to_labels": {
+            "game_of_life01": "01",
+            "game_of_life02": "02",
+            "game_of_life02_tiled": "02 (tiled)",
+            "game_of_life03": "03",
+            "game_of_life04": "04",
+            "game_of_life05": "05",
+            "game_of_life06": "06"
+        },
+        "y_label": "Time per one cell [ns]",
+        "time_transform": "time / 16384 / 200 * 1000 * 1000",
+        "included_references_ids": [
+            "baseline/gol",
+            "naive-bitwise/gol",
+            "popc-bitwise-macro/gol",
+            "tiled-bitwise-macro/gol",
+            "sota-adder/gol"
+        ],
+        "references_labels": {
+            "baseline/gol": "Baseline (\\texttt{byte} grid)",
+            "naive-bitwise/gol": "Naive Bitwise",
+            "popc-bitwise-macro/gol": "Rows Optimal",
+            "tiled-bitwise-macro/gol": "Tiles Optimal",
+            "sota-adder/gol": "Full Adder",
+
+            "dumb-bit-per-thr/gol": "Dumb bit per thread",
+            "smarter-bit-per-thr/gol": "Smarter bit per thread",
+            "popc-bitwise/gol": "POPC bitwise"
+        }
+    },
+    "hist": {
+        "title": "Histogram",
+        "y_axis_from_to": [0.5, 60],
+        "class_ids_to_labels": {
+            "histogram01": "01",
+            "histogram02": "02",
+            "histogram03": "03",
+            "histogram04": "04",
+            "histogram05": "05",
+            "histogram06": "06",
+            "histogram07": "07"
+        },
+        "y_label": "Time [ms]",
+        "references_labels": {
+            "base/code": "Baseline",
+            "base-shm/code": "Baseline (\\texttt{shm})",
+            "best-expected/code": "Best expected",
+            "best-possible/code": "Best possible"
+        },
+        "included_references_ids": [
+            "base-shm/code",
+            "best-expected/code",
+            "best-possible/code"
+        ]
+    },
+    "single-graph-style":{
+        "style": {
+            "font_sizes": {
+                "base": 18,
+                "axes_label": 22,
+                "title": 22,
+                "tick_label": 22,
+                "legend": 18
+            },
+            "figure": {
+                "width": 12,
+                "height": 6,
+                "dpi": 300
+            },
+            "markers": {
+                "average_size": 2000,
+                "individual_size": 90,
+                "average_line_width": 3,
+                "individual_line_width": 1.5,
+                "reference_line_width": 2.0
+            },
+            "layout": {
+                "jitter_factor": 70,
+                "padding": 2.0,
+                "marker_alpha": 0.7,
+                "reference_line_alpha": 0.65,
+                "grid_line_width": 0.5,
+                "grid_alpha": 0.7
+            }
+        }
+    },
+    "two-graphs-in-row-style": {
+        "style": {
+            "font_sizes": {
+                "base": 18,
+                "axes_label": 20,
+                "title": 22,
+                "tick_label": 15,
+                "legend": 12
+            },
+            "figure": {
+                "width": 6,
+                "height": 4.5,
+                "dpi": 300
+            },
+            "markers": {
+                "average_size": 1500,
+                "individual_size": 40,
+                "average_line_width": 2,
+                "individual_line_width": 1,
+                "reference_line_width": 1.5
+            },
+            "layout": {
+                "jitter_factor": 70,
+                "padding": 2.0,
+                "marker_alpha": 0.7,
+                "reference_line_alpha": 0.65,
+                "grid_line_width": 0.5,
+                "grid_alpha": 0.7,
+                "legend_y_offset": 0.13
+            }
+        }
+    },
+    "first-graph": {
+        "style": {
+            "figure": {
+                "use_legend": false
+            }
+        }
+    },
+    "second-graph": {
+        "style": {
+            "figure": {
+                "use_y_label": false
+            }
+        }
+    },
+    "no-paper-print": {
+        "style": {
+            "figure": {
+                "width": 12,
+                "height": 8
+            }
+        }
+    },
+    "with-log-scale": {
+        "style": {
+            "figure": {
+                "log_scale": true
+            },
+            "layout": {
+                "legend_position": "lower left"
+            }
+        }
+    },
+    "auto-boundaries": {
+        "y_axis_from_to": null
+    },
+    "narrow-hist": {
+        "style": {
+            "figure": {
+                "height": 3.8
+            }
+        }
+    },
+    "narrow-gol": {
+        "style": {
+            "figure": {
+                "height": 5
+            }
+        }
+    },
+    "<example config - config id>": {
+        "title": "<title>",
+        "class_ids_to_labels": {
+            "game_of_life01": "Prompt 01",
+            "...": "..."
+        },
+        "y_label": "Time per one cell [ns]",
+        "time_transform": "time / 16384 / 200 * 1000 * 1000",
+        "y_axis_from_to": [0, 330],
+        "included_references_ids": [
+            "baseline/gol",
+            "..."
+        ],
+        "references_labels": {
+            "baseline/gol": "Baseline",
+            "...": "..."
+        },
+        "style": {
+            "font_sizes": {
+                "base": 18,
+                "axes_label": 20,
+                "title": 22,
+                "tick_label": 18,
+                "legend": 18
+            },
+            "figure": {
+                "width": 12,
+                "height": 8,
+                "dpi": 300
+            },
+            "markers": {
+                "average_size": 2000,
+                "individual_size": 90,
+                "average_line_width": 3,
+                "individual_line_width": 1.5,
+                "reference_line_width": 2.0
+            },
+            "layout": {
+                "jitter_factor": 100,
+                "padding": 2.0,
+                "marker_alpha": 0.7,
+                "reference_line_alpha": 0.65,
+                "grid_line_width": 0.5,
+                "grid_alpha": 0.7
+            }
+        }
+    }
+}

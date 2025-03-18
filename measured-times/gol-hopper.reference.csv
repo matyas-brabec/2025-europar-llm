@@ -1,0 +1,9 @@
+experiment_id;time;std;compiled;verified;runtime_err;extra
+baseline/gol;590.8121;0.02198840603589787;True;True;;
+naive-bitwise/gol;110.56590000000001;0.012549501982149278;True;True;;
+popc-bitwise-macro/gol;59.14693;0.008811135000668867;True;True;;
+popc-bitwise/gol;80.34558999999999;0.009630726867684266;True;True;;
+sota-adder/gol;9.453143;0.010523570734308962;True;True;;
+tiled-bitwise-macro/gol;35.00663;0.003655694188522291;True;True;;
+dumb-bit-per-thr/gol;512.6912;0.0034871191548224555;True;True;;
+smarter-bit-per-thr/gol;520.7016;0.005765414122163893;True;True;;

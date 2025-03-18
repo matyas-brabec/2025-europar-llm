@@ -1,0 +1,14 @@
+{
+  "model": "o3-mini-2025-01-31",
+  "reasoning_effort": "low",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Your goal is to generate high-performance code."
+    },
+    {
+      "role": "user",
+      "content": "Generate a Python script that will load two numbers from the input (each on separate line) and print their sum."
+    }
+  ]
+}

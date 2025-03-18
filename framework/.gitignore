@@ -1,0 +1,5 @@
+**/bin
+**/experiments-outputs
+**/__work_dir__
+**/__log_dir__
+run-all-gol-exp.sh

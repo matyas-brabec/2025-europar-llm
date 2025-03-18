@@ -1,0 +1,5 @@
+experiment_id;time;std;compiled;verified;runtime_err;extra
+base/code;257.305;0.0515761;True;True;;
+base-shm/code;5.50993;0.0012884;True;True;;
+best-expected/code;2.21956;0.00138505;True;True;;
+best-possible/code;0.706867;0.00126698;True;True;;

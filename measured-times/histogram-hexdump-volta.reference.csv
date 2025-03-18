@@ -1,0 +1,5 @@
+experiment_id;time;std;compiled;verified;runtime_err;extra
+base/code;423.059;0.0068007;True;True;;DATA=hex
+base-shm/code;7.48288;0.00114472;True;True;;DATA=hex
+best-expected/code;4.21141;0.00436972;True;True;;DATA=hex
+best-possible/code;1.50559;0.00215042;True;True;;DATA=hex

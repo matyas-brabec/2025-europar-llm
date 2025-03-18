@@ -1,0 +1,1 @@
+Generate a Python script that will load two numbers from the input (each on separate line) and print their sum.
