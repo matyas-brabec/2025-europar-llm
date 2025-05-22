@@ -23,7 +23,7 @@ all: $(TARGET)
 
 $(TARGET): $(TARGET).cpp $(HEADERS) $(KERNEL_OBJS)
 	@echo Compiling and linking executable "$@" ...
-	@$(CPP) $(CFLAGS) $(addprefix -I,$(INCLUDE)) $(LDFLAGS) $(addprefix -L,$(LIBDIRS)) $(addprefix -l,$(LIBS)) -lcudart $(KERNEL_OBJS) $< -o $@
+	@$(CPP) $(CFLAGS) $(addprefix -I,$(INCLUDE)) $(LDFLAGS) $(addprefix -L,$(LIBDIRS)) $(KERNEL_OBJS) $< -o $@ $(addprefix -l,$(LIBS)) -lcudart
 
 %.obj: %.cu
 	@echo Compiling kernels in "$<" ...
