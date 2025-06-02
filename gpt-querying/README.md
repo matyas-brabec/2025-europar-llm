@@ -4,13 +4,13 @@
 
 (Note that this subdirectory requires different dependencies than `./framework`. The base requirement is Python 3.8 or higher.)
 
-1. (Optional): create virtual environment: `python3 -m venv .venv` and activate it: `source .venv/bin/activate`
-2. install requirements: `pip install -r requirements.txt`
+1. (Optional): Create the virtual environment: `python3 -m venv .venv` and activate it: `source .venv/bin/activate`
+2. Install requirements: `pip install -r requirements.txt`
 
 To use OpenAI (paid API):
 
-* create API key: <https://platform.openai.com/api-keys>
-* rename `.env.example` to `.env` and save the API key there
+* Create an API key: <https://platform.openai.com/api-keys>
+* Rename `.env.example` to `.env` and save the API key there
 
 If you want to use a different LLM, you can modify the `MODEL` variable in the `main.py` file. The default is set to `o3-mini-2025-01-31`, which is the latest OpenAI model as of January 2025. Note that requests to other models may incur different costs and require different API keys (or also different API configurations).
 
@@ -23,7 +23,7 @@ To obtain LLM responses for a batch, follow the [OpenAI guide](https://platform.
 
 ## Code handling notes
 
-Sometimes, it was necessary to fix bugs in LLM generated code. Each fixed bug (line or a small block) is labeled with `@FIXED` annotation in doc-comment (prefixed with `///`) and the original is kept in comment like this:
+Sometimes, it was necessary to fix bugs in LLM-generated code. Each fixed bug (line or a small block) is labeled with a `@FIXED` annotation in doc-comment (prefixed with `///`), and the original is kept in a comment like this:
 
 ```c++
 // Assumptions:

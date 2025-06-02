@@ -25,7 +25,7 @@ To navigate this repository more easily, here is an index:
 | ✍️ Single-Response Prompts | All prompts are in the [~/prompts](./prompts/) folder. Apart from the prompt files (`.prompt.md`), it also contains common parts that can be included in prompts. |
 | 🤖 Generated "Single-Response" Sources | Generated code in the *"Single-Response"* mode is in [~/results](./results/). Individual solutions for each prompt and its 10 attempts are in [~/results/histogram](./results/histogram/), [~/results/gol](./results/gol/), and [~/results/knn](./results/knn/). |
 | 🧐 Reviews | Code reviews for *"Single-Response"* generated code are in the [~/reviews](./reviews/) directory. |
-| 📊 Measurements | Code measurements for tested architectures (`Ampere`, `Volta`, and `Hopper`) are in [~/measured-times](./measured-times/). The format is CSV. For each architecture and problem, there are three CSVs: one for *"Single-Response"* codes, one for reference solutions, and one for interactive prompting. The pregenerated graph are located in [~/measured-times/graphs](./measured-times/graphs/). |
+| 📊 Measurements | Code measurements for tested architectures (`Ampere`, `Volta`, and `Hopper`) are in [~/measured-times](./measured-times/). The format is CSV. For each architecture and problem, there are three CSVs: one for *"Single-Response"* codes, one for reference solutions, and one for interactive prompting. The pre-generated graphs are located in [~/measured-times/graphs](./measured-times/graphs/). |
 
 ## Tutorial 🚀
 
@@ -74,7 +74,7 @@ To generate new implementations, provide the selected **LLM** with the **system 
 
 ## Framework 🏗️
 
-Once you have generated or selected an implementation to test, navigate to the [framework](./framework) directory. We provide a Python script, [run-experiments.py](./framework/run-experiments.py), to test selected solutions (requiring Python 3.8 or higher and virtual environment set up as described in [framework/README.md](./framework/README.md)).
+Once you have generated or selected an implementation to test, navigate to the [framework](./framework) directory. We provide a Python script, [run-experiments.py](./framework/run-experiments.py), to test selected solutions (requiring Python 3.8 or higher and the virtual environment set up as described in [framework/README.md](./framework/README.md)).
 
 ### Running Experiments 🏃‍♂️📊
 
