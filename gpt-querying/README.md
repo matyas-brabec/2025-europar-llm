@@ -2,6 +2,8 @@
 
 ## Installation
 
+(Note that this subdirectory requires different dependencies than `./framework`. The base requirement is Python 3.8 or higher.)
+
 1. (Optional): create virtual environment: `python3 -m venv .venv` and activate it: `source .venv/bin/activate`
 2. install requirements: `pip install -r requirements.txt`
 
@@ -9,6 +11,8 @@ To use OpenAI (paid API):
 
 * create API key: <https://platform.openai.com/api-keys>
 * rename `.env.example` to `.env` and save the API key there
+
+If you want to use a different LLM, you can modify the `MODEL` variable in the `main.py` file. The default is set to `o3-mini-2025-01-31`, which is the latest OpenAI model as of January 2025. Note that requests to other models may incur different costs and require different API keys (or also different API configurations).
 
 ## Usage
 

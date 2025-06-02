@@ -1,10 +1,10 @@
 # 🔬🤖 Tutoring LLM into a Better CUDA Optimizer ⚡🎯
 
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENCE) [![doi](https://img.shields.io/badge/DOI-TODO-blue)](todo)
+[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![ZENODO](https://img.shields.io/badge/ZENODO-TODO-blue)](todo) [![DOI](https://img.shields.io/badge/DOI-TODO-blue)](todo)
 
 This repository is associated with the following paper:
 
-```
+```bibtex
 @inproceedings { TODO }
 ```
 
@@ -45,7 +45,7 @@ cd framework/game-of-life/infrastructure  # Game of Life base directory
 cd framework/knn                   # k-NN base directory
 ```
 
-To compile and run with the default parameters (those tested in the paper), simply run `make` followed by `make run` in the chosen base directory:
+To compile and run with the default parameters (those tested in the paper), simply run `make` followed by `make run` in the chosen base directory (note that the `knn` part requires `CMake` of version 3.20 or higher):
 
 ```bash
 make      # Compiling the code
@@ -74,12 +74,15 @@ To generate new implementations, provide the selected **LLM** with the **system 
 
 ## Framework 🏗️
 
-Once you have generated or selected an implementation to test, navigate to the [framework](./framework) directory. We provide a Python script, [run-experiments.py](./framework/run-experiments.py), to test selected solutions.
+Once you have generated or selected an implementation to test, navigate to the [framework](./framework) directory. We provide a Python script, [run-experiments.py](./framework/run-experiments.py), to test selected solutions (requiring Python 3.8 or higher and virtual environment set up as described in [framework/README.md](./framework/README.md)).
 
-#### Running Experiments 🏃‍♂️📊
+### Running Experiments 🏃‍♂️📊
 
 ```bash
 cd framework
+
+# (Set up and activate the virtual environment if not done yet)
+
 python3 run-experiments.py <infrastructure_directory> <implementations_directory>
 ```
 
@@ -130,38 +133,10 @@ smarter-bit-per-thr/gol;520.7016;0.005765;True;True;;
 
 ## Graphs 📊
 
-To reproduce graphs similar to those in the paper, use the Python script [print-graph.py](./framework/print-graph.py):
+To reproduce graphs presented in the paper, run the following command in the `measured-times` directory (this requires Python 3.8 or higher and automatically sets up a virtual environment `.venv` in the `framework` directory):
 
 ```bash
-python3 print-graph.py <config_keys> <path_to_experiments> <path_to_references> [tag]
+bash generate_all_graphs.sh
 ```
 
-### Parameters ⚙️📝
-
-1. **Config keys**: Specifies graph styles based on [print-graph.config.json](./framework/print-graph.config.json). Combine multiple keys using `@` (e.g., `hist@with-log-scale`).
-2. **Path to experiments**: The CSV file containing experiment results.
-3. **Path to references**: The CSV file containing reference results.
-4. **Tag (optional)**: A tag for naming the output file.
-
-#### Example Usage 📌
-
-```bash
-cd framework
-python3 print-graph.py gol@with-log-scale ../measured-times/gol-hopper.csv ../measured-times/gol-hopper.csv TESTING_GRAPH_
-```
-
-This generates a file `TESTING_GRAPH_gol-hopper.graph.pdf` in the framework directory.
-
-#### Requirements 🛠️📦
-
-To run **print-graph.py**, install the following Python packages:
-
-```bash
-pip install pandas matplotlib numpy json5
-```
-
-Additionally, **LaTeX is required** for proper graph rendering. If LaTeX is not installed, disable it in `print-graph.py` by setting:
-
-```python
-plt.rcParams["text.usetex"] = False
-```
+This script generates all presented graphs (and some unused variants) from the CSV files in the `measured-times` directory and saves them in the `graphs` subdirectory.

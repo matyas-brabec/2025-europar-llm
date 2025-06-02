@@ -80,7 +80,7 @@ if not os.path.exists(config_filename):
     print(f"Error: Config file '{config_filename}' not found.")
     sys.exit(1)
 
-with open(config_filename, "r") as f:
+with open(config_filename, 'r', encoding='utf-8') as f:
     config_all = json.load(f)
 
 config_keys = config_key.split("@")
@@ -106,7 +106,7 @@ layout_config = style_config.get("layout", DEFAULT_STYLE["layout"])
 
 # Set Use TeX to False to use the default font
 plt.rcParams.update({
-    "text.usetex": True,
+    "text.usetex": style_config.get("use_tex", False),
     "font.family": "serif",
     "font.serif": ["Computer Modern Roman"],
     "font.weight": "bold",
