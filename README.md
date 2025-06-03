@@ -1,8 +1,8 @@
 # 🔬🤖 Tutoring LLM into a Better CUDA Optimizer ⚡🎯
 
-[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![ZENODO](https://img.shields.io/badge/ZENODO-TODO-blue)](todo) [![DOI](https://img.shields.io/badge/DOI-TODO-blue)](todo)
+[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![zenodo](https://img.shields.io/badge/zenodo-10.5281/zenodo.15580207-blue)](https://doi.org/10.5281/zenodo.15580207) [![DOI](https://img.shields.io/badge/DOI-TODO-blue)](todo)
 
-This repository is associated with the following paper:
+This repository contains the replication package for the paper titled *"Tutoring LLM into a Better CUDA Optimizer"* presented at Euro-Par 2025.
 
 ```bibtex
 @inproceedings { TODO }
