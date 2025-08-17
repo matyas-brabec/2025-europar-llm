@@ -408,7 +408,9 @@ __global__ void knn2d_kernel(
 }
 
 // Host API: launch configuration and shared memory sizing
-extern "C" void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
+/// @FIXED
+/// extern "C" void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
+void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
     // Configure grid: one warp per query
     const int warps_per_block   = WARPS_PER_BLOCK;           // 4
     const int threads_per_block = THREADS_PER_BLOCK;         // 128

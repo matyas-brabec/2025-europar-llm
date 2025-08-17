@@ -123,6 +123,10 @@ void run_histogram(const char *input, unsigned int *histogram, unsigned int inpu
     const unsigned int blocks = (threadsNeeded + threadsPerBlock - 1) / threadsPerBlock;
 
     // Dynamic shared memory size: one sub-histogram per warp in the block
+    /// @FIXED
+    int warpSize = 0;
+    /// @FIXED
+    cudaDeviceGetAttribute(&warpSize, cudaDevAttrWarpSize, 0);
     const size_t shmemSize = static_cast<size_t>(rangeLen) * static_cast<size_t>(threadsPerBlock / warpSize) * sizeof(unsigned int);
 
     // Launch kernel on default stream

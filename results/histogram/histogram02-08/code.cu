@@ -101,7 +101,9 @@ __global__ void histogram_range_kernel(const char* __restrict__ input,
 // - 'input' and 'histogram' are device pointers allocated with cudaMalloc.
 // - 'histogram' has room for (to - from + 1) bins.
 // - Caller handles synchronization (this function enqueues work on the default stream).
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_histogram(const char *input, unsigned int *histogram, unsigned int inputSize, int from, int to) {
     const int numBins = to - from + 1;
     if (!input || !histogram || inputSize == 0 || numBins <= 0) {

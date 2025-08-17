@@ -132,8 +132,12 @@ __global__ void knn2d_warp_kernel(
 
     // Per-warp in-register top-k storage (distributed across lanes)
     const int slots_per_lane = k >> 5; // k / 32; k is power of 2 >= 32, so divisible by 32
-    float topkDist[slots_per_lane];
-    int   topkIdx[slots_per_lane];
+    /// @FIXED
+    /// float topkDist[slots_per_lane];
+    float topkDist[32]; // Use fixed size for simplicity, as k is limited to 1024 (32 slots max)
+    /// @FIXED
+    /// int   topkIdx[slots_per_lane];
+    int   topkIdx[32]; // Use fixed size for simplicity, as k is limited to 1024 (32 slots max)
 
     // Initialize top-k to +inf and invalid index
     #pragma unroll

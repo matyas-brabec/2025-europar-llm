@@ -348,7 +348,9 @@ __global__ void knn_kernel(
 // data:  device pointer to float2 data points of size data_count
 // result: device pointer to std::pair<int,float> array of size query_count * k (contiguous)
 // k: power of two in [32, 1024], data_count >= k
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_knn(const float2 *query, int query_count,
              const float2 *data,  int data_count,
              std::pair<int, float> *result, int k)

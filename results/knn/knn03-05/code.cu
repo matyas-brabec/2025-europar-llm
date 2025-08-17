@@ -134,7 +134,9 @@ __global__ void knn_kernel_2d_warp(const float2* __restrict__ query,
 
                 // Compute the current global worst value across the warp (max of lane-local worsts).
                 // Note: __reduce_max_sync returns the maximum across the active warp lanes.
-                float worstVal = __reduce_max_sync(fullMask, localWorstVal);
+                /// @FIXED
+                /// float worstVal = __reduce_max_sync(fullMask, localWorstVal);
+                float worstVal = __reduce_max_sync(fullMask, reinterpret_cast<unsigned&>(localWorstVal)); // unsigned and positive float reinterpretations follow the same ordering
 
                 // Quickly reject if the candidate is not better than the global worst.
                 if (dist < worstVal) {

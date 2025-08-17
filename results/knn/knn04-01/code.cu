@@ -293,7 +293,9 @@ __global__ void knn_kernel_warp32(const float2* __restrict__ query, int query_co
 // - data:  pointer to device array of float2 (size data_count)
 // - result: pointer to device array of std::pair<int,float> (size query_count * k)
 // - k: power of two between 32 and 1024 inclusive
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_knn(const float2 *query, int query_count,
              const float2 *data,  int data_count,
              std::pair<int, float> *result, int k)

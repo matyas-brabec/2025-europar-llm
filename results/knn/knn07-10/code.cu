@@ -159,7 +159,9 @@ __device__ void flush_and_merge_warp(float *&inter_d, int *&inter_i,
 // [ int    buf_idxs   [WARPS_PER_BLOCK][k] ]
 // [ int    buf_counts [WARPS_PER_BLOCK]    ]
 // [ float  max_dists  [WARPS_PER_BLOCK]    ]
-extern "C" __global__
+/// @FIXED
+/// extern "C" __global__
+__global__
 void knn_kernel_warp(const float2 * __restrict__ query,
                      int query_count,
                      const float2 * __restrict__ data,

@@ -92,7 +92,9 @@ static __device__ __forceinline__ void heap_sort_ascending(float* dist, int* idx
     // After this, dist[0..length-1] is ascending
 }
 
-extern "C" __global__ void knn_kernel(const float2* __restrict__ query,
+/// @FIXED
+/// extern "C" __global__ void knn_kernel(const float2* __restrict__ query,
+__global__ void knn_kernel(const float2* __restrict__ query,
                                       int query_count,
                                       const float2* __restrict__ data,
                                       int data_count,
@@ -275,7 +277,9 @@ extern "C" __global__ void knn_kernel(const float2* __restrict__ query,
 }
 
 // Host interface: launches the kernel
-extern "C" void run_knn(const float2 *query, int query_count,
+/// @FIXED
+/// extern "C" void run_knn(const float2 *query, int query_count,
+void run_knn(const float2 *query, int query_count,
                         const float2 *data, int data_count,
                         std::pair<int, float> *result, int k)
 {

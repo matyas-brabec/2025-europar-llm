@@ -85,7 +85,9 @@ __global__ void histogram_kernel(const char* __restrict__ input,
 // - inputSize: number of chars in input.
 // - from, to: inclusive range [from, to] of chars to count.
 // Assumes synchronization is handled by the caller (e.g., cudaDeviceSynchronize after this call).
-extern "C" void run_histogram(const char *input, unsigned int *histogram,
+/// @FIXED
+/// extern "C" void run_histogram(const char *input, unsigned int *histogram,
+void run_histogram(const char *input, unsigned int *histogram,
                               unsigned int inputSize, int from, int to)
 {
     const unsigned int numBins = static_cast<unsigned int>(to - from + 1);

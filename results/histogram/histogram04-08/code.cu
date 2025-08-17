@@ -121,6 +121,10 @@ void run_histogram(const char *input, unsigned int *histogram, unsigned int inpu
     if (gridSize > 65535u) gridSize = 65535u; // 1D grid limit
 
     // Compute dynamic shared memory size: warpsPerBlock * paddedBins
+    /// @FIXED
+    int warpSize = 0;
+    /// @FIXED
+    cudaDeviceGetAttribute(&warpSize, cudaDevAttrWarpSize, device);
     const int warpsPerBlock = (kBlockSize + warpSize - 1) / warpSize;
     const int histStride = ((rangeLen + 31) / 32) * 32;
     const size_t shmemSize = static_cast<size_t>(warpsPerBlock) * static_cast<size_t>(histStride) * sizeof(unsigned int);
