@@ -1,155 +1,168 @@
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+#include <stdint.h>
 
-// Define block dimension (tile size). We choose 32x32 threads per block for high occupancy on modern GPUs.
-#define BLOCK_DIM 32
+/*
+  High-performance CUDA implementation of one step of Conway's Game of Life.
 
-// CUDA kernel to perform one iteration of Conway's Game of Life.
-// Uses shared memory tiling with a 1-cell halo to avoid redundant global memory loads.
-__global__ void game_of_life_kernel(const bool *input, bool *output, int grid_dim) {
-    // Calculate global coordinates of the cell handled by this thread.
-    int x = blockIdx.x * BLOCK_DIM + threadIdx.x;
-    int y = blockIdx.y * BLOCK_DIM + threadIdx.y;
+  Key performance choices:
+  - Tiled shared-memory stencil with 1-cell halo in each direction minimizes redundant global loads.
+  - 32x32 thread blocks (1024 threads) map naturally to 32-lane warps along x for coalesced memory access.
+  - Interior blocks (not at the domain boundaries) avoid bounds checks entirely; boundary blocks apply clamped loads (outside = 0).
+  - Branch-free update rule using bitwise logic: next = (sum == 3) | (alive & (sum == 2)).
 
-    // Indices in the shared memory tile. We offset by 1 to leave room for the halo.
-    int s_x = threadIdx.x + 1;
-    int s_y = threadIdx.y + 1;
+  Notes:
+  - Grid is square, size is a power-of-two and >= 512, which is divisible by 32. This makes every block fully occupied.
+  - All outside-of-grid cells are treated as dead (0).
+  - Input and output are bool arrays allocated with cudaMalloc. We operate on them as bytes on device.
+*/
 
-    // Declare a shared memory tile with an extra border (halo) of 1 cell on each side.
-    __shared__ bool tile[BLOCK_DIM + 2][BLOCK_DIM + 2];
+template <int BX, int BY>
+__device__ __forceinline__ unsigned char ld_cell_nocheck(const bool* __restrict__ in, int width, int x, int y) {
+    // Fast path: caller ensures x,y are in-bounds.
+    return static_cast<unsigned char>(in[y * width + x]);
+}
 
-    // Load the central cell into shared memory if within bounds; otherwise, set to false.
-    if (x < grid_dim && y < grid_dim)
-        tile[s_y][s_x] = input[y * grid_dim + x];
-    else
-        tile[s_y][s_x] = false;
+template <int BX, int BY>
+__device__ __forceinline__ unsigned char ld_cell_clamped(const bool* __restrict__ in, int width, int height, int x, int y) {
+    // Slow path: return 0 if out-of-bounds, otherwise return cell value as 0/1.
+    if ((unsigned)x >= (unsigned)width || (unsigned)y >= (unsigned)height) return 0;
+    return static_cast<unsigned char>(in[y * width + x]);
+}
 
-    // Load halo cells along the left and right borders.
-    if (threadIdx.x == 0) {
-        int x_left = x - 1;
-        if (x_left >= 0 && y < grid_dim)
-            tile[s_y][s_x - 1] = input[y * grid_dim + x_left];
-        else
-            tile[s_y][s_x - 1] = false;
-    }
-    if (threadIdx.x == BLOCK_DIM - 1) {
-        int x_right = x + 1;
-        if (x_right < grid_dim && y < grid_dim)
-            tile[s_y][s_x + 1] = input[y * grid_dim + x_right];
-        else
-            tile[s_y][s_x + 1] = false;
-    }
+template <int BX, int BY>
+__launch_bounds__(BX * BY, 2)
+__global__ void game_of_life_kernel_tiled(const bool* __restrict__ in, bool* __restrict__ out, int width, int height) {
+    // Tile size includes a 1-cell halo on all sides.
+    constexpr int TILE_W = BX + 2;
+    constexpr int TILE_H = BY + 2;
 
-    // Load halo cells along the top and bottom borders.
-    if (threadIdx.y == 0) {
-        int y_top = y - 1;
-        if (y_top >= 0 && x < grid_dim)
-            tile[s_y - 1][s_x] = input[y_top * grid_dim + x];
-        else
-            tile[s_y - 1][s_x] = false;
-    }
-    if (threadIdx.y == BLOCK_DIM - 1) {
-        int y_bottom = y + 1;
-        if (y_bottom < grid_dim && x < grid_dim)
-            tile[s_y + 1][s_x] = input[y_bottom * grid_dim + x];
-        else
-            tile[s_y + 1][s_x] = false;
-    }
+    // Use a 1D shared memory buffer with row-major layout for fast index math.
+    __shared__ unsigned char tile[TILE_W * TILE_H];
 
-    // Load halo cells at the four corners.
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        int x_left = x - 1;
-        int y_top = y - 1;
-        if (x_left >= 0 && y_top >= 0)
-            tile[s_y - 1][s_x - 1] = input[y_top * grid_dim + x_left];
-        else
-            tile[s_y - 1][s_x - 1] = false;
-    }
-    if (threadIdx.x == BLOCK_DIM - 1 && threadIdx.y == 0) {
-        int x_right = x + 1;
-        int y_top = y - 1;
-        if (x_right < grid_dim && y_top >= 0)
-            tile[s_y - 1][s_x + 1] = input[y_top * grid_dim + x_right];
-        else
-            tile[s_y - 1][s_x + 1] = false;
-    }
-    if (threadIdx.x == 0 && threadIdx.y == BLOCK_DIM - 1) {
-        int x_left = x - 1;
-        int y_bottom = y + 1;
-        if (x_left >= 0 && y_bottom < grid_dim)
-            tile[s_y + 1][s_x - 1] = input[y_bottom * grid_dim + x_left];
-        else
-            tile[s_y + 1][s_x - 1] = false;
-    }
-    if (threadIdx.x == BLOCK_DIM - 1 && threadIdx.y == BLOCK_DIM - 1) {
-        int x_right = x + 1;
-        int y_bottom = y + 1;
-        if (x_right < grid_dim && y_bottom < grid_dim)
-            tile[s_y + 1][s_x + 1] = input[y_bottom * grid_dim + x_right];
-        else
-            tile[s_y + 1][s_x + 1] = false;
-    }
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
 
-    // Synchronize to ensure all shared memory loads complete before computing.
-    __syncthreads();
+    const int x = bx * BX + tx;
+    const int y = by * BY + ty;
 
-    // Perform computation only if the global thread index is within the grid bounds.
-    if (x < grid_dim && y < grid_dim) {
-        int live_neighbors = 0;
-        // Sum the states of the eight neighboring cells in shared memory.
-        live_neighbors += tile[s_y - 1][s_x - 1];
-        live_neighbors += tile[s_y - 1][s_x];
-        live_neighbors += tile[s_y - 1][s_x + 1];
-        live_neighbors += tile[s_y][s_x - 1];
-        live_neighbors += tile[s_y][s_x + 1];
-        live_neighbors += tile[s_y + 1][s_x - 1];
-        live_neighbors += tile[s_y + 1][s_x];
-        live_neighbors += tile[s_y + 1][s_x + 1];
+    // Shared memory index of the "center" element corresponding to (x,y).
+    const int s_idx = (ty + 1) * TILE_W + (tx + 1);
 
-        // Retrieve current cell state.
-        bool alive = tile[s_y][s_x];
-        bool new_state = false;
+    // Determine if this is a strictly interior block (i.e., all neighbors exist in-bounds).
+    const bool interiorBlock = (bx > 0 && bx < gridDim.x - 1 && by > 0 && by < gridDim.y - 1);
 
-        // Apply Conway's Game of Life rules.
-        if (alive) {
-            // Any live cell with two or three live neighbors survives.
-            new_state = (live_neighbors == 2 || live_neighbors == 3);
-        } else {
-            // Any dead cell with exactly three live neighbors becomes a live cell.
-            new_state = (live_neighbors == 3);
+    if (interiorBlock) {
+        // Center cell
+        tile[s_idx] = ld_cell_nocheck<BX, BY>(in, width, x, y);
+
+        // Halo in X
+        if (tx == 0) {
+            tile[(ty + 1) * TILE_W + 0] = ld_cell_nocheck<BX, BY>(in, width, x - 1, y);
+        }
+        if (tx == BX - 1) {
+            tile[(ty + 1) * TILE_W + (BX + 1)] = ld_cell_nocheck<BX, BY>(in, width, x + 1, y);
         }
 
-        // Write the new state to global memory.
-        output[y * grid_dim + x] = new_state;
+        // Halo in Y
+        if (ty == 0) {
+            tile[0 * TILE_W + (tx + 1)] = ld_cell_nocheck<BX, BY>(in, width, x, y - 1);
+        }
+        if (ty == BY - 1) {
+            tile[(BY + 1) * TILE_W + (tx + 1)] = ld_cell_nocheck<BX, BY>(in, width, x, y + 1);
+        }
+
+        // Corner halos
+        if (tx == 0 && ty == 0) {
+            tile[0] = ld_cell_nocheck<BX, BY>(in, width, x - 1, y - 1);
+        }
+        if (tx == BX - 1 && ty == 0) {
+            tile[0 * TILE_W + (BX + 1)] = ld_cell_nocheck<BX, BY>(in, width, x + 1, y - 1);
+        }
+        if (tx == 0 && ty == BY - 1) {
+            tile[(BY + 1) * TILE_W + 0] = ld_cell_nocheck<BX, BY>(in, width, x - 1, y + 1);
+        }
+        if (tx == BX - 1 && ty == BY - 1) {
+            tile[(BY + 1) * TILE_W + (BX + 1)] = ld_cell_nocheck<BX, BY>(in, width, x + 1, y + 1);
+        }
+    } else {
+        // Boundary blocks: clamp out-of-bounds to 0.
+        unsigned char c = 0;
+        if ((unsigned)x < (unsigned)width && (unsigned)y < (unsigned)height) {
+            c = static_cast<unsigned char>(in[y * width + x]);
+        }
+        tile[s_idx] = c;
+
+        if (tx == 0) {
+            tile[(ty + 1) * TILE_W + 0] = ((x > 0) && ((unsigned)y < (unsigned)height)) ? static_cast<unsigned char>(in[y * width + (x - 1)]) : 0;
+        }
+        if (tx == BX - 1) {
+            tile[(ty + 1) * TILE_W + (BX + 1)] = ((x + 1 < width) && ((unsigned)y < (unsigned)height)) ? static_cast<unsigned char>(in[y * width + (x + 1)]) : 0;
+        }
+        if (ty == 0) {
+            tile[0 * TILE_W + (tx + 1)] = ((y > 0) && ((unsigned)x < (unsigned)width)) ? static_cast<unsigned char>(in[(y - 1) * width + x]) : 0;
+        }
+        if (ty == BY - 1) {
+            tile[(BY + 1) * TILE_W + (tx + 1)] = ((y + 1 < height) && ((unsigned)x < (unsigned)width)) ? static_cast<unsigned char>(in[(y + 1) * width + x]) : 0;
+        }
+
+        if (tx == 0 && ty == 0) {
+            tile[0] = (x > 0 && y > 0) ? static_cast<unsigned char>(in[(y - 1) * width + (x - 1)]) : 0;
+        }
+        if (tx == BX - 1 && ty == 0) {
+            tile[0 * TILE_W + (BX + 1)] = ((x + 1 < width) && (y > 0)) ? static_cast<unsigned char>(in[(y - 1) * width + (x + 1)]) : 0;
+        }
+        if (tx == 0 && ty == BY - 1) {
+            tile[(BY + 1) * TILE_W + 0] = ((x > 0) && (y + 1 < height)) ? static_cast<unsigned char>(in[(y + 1) * width + (x - 1)]) : 0;
+        }
+        if (tx == BX - 1 && ty == BY - 1) {
+            tile[(BY + 1) * TILE_W + (BX + 1)] = ((x + 1 < width) && (y + 1 < height)) ? static_cast<unsigned char>(in[(y + 1) * width + (x + 1)]) : 0;
+        }
     }
+
+    __syncthreads();
+
+    // Safety guard for non-multiple-of-block sizes (not needed for the power-of-two inputs but keeps the kernel robust).
+    if ((unsigned)x >= (unsigned)width || (unsigned)y >= (unsigned)height) {
+        return;
+    }
+
+    // Sum the 8 neighbors from the shared-memory tile.
+    const int idx = s_idx;
+    int sum = 0;
+    // Top row neighbors
+    sum += tile[idx - TILE_W - 1];
+    sum += tile[idx - TILE_W];
+    sum += tile[idx - TILE_W + 1];
+    // Left and right neighbors
+    sum += tile[idx - 1];
+    sum += tile[idx + 1];
+    // Bottom row neighbors
+    sum += tile[idx + TILE_W - 1];
+    sum += tile[idx + TILE_W];
+    sum += tile[idx + TILE_W + 1];
+
+    // Alive state and next state (branch-free rule application).
+    const unsigned char alive = tile[idx];
+    const int is2 = (sum == 2);
+    const int is3 = (sum == 3);
+    const unsigned char next = static_cast<unsigned char>(is3 | (alive & is2));
+
+    out[y * width + x] = (next != 0);
 }
 
-// Host function to run one simulation step of Conway's Game of Life.
-// It launches the CUDA kernel to compute the next generation.
-// The input and output pointers are assumed to be device pointers allocated with cudaMalloc.
 void run_game_of_life(const bool* input, bool* output, int grid_dimensions) {
-    // Define block and grid dimensions.
-    dim3 block(BLOCK_DIM, BLOCK_DIM);
-    dim3 grid((grid_dimensions + BLOCK_DIM - 1) / BLOCK_DIM, (grid_dimensions + BLOCK_DIM - 1) / BLOCK_DIM);
+    // Launch parameters tuned for modern data center GPUs (A100/H100).
+    // 32x32 threads per block gives excellent memory coalescing and utilization.
+    constexpr int BX = 32;
+    constexpr int BY = 32;
 
-    // Launch the kernel.
-    game_of_life_kernel<<<grid, block>>>(input, output, grid_dimensions);
+    const int width = grid_dimensions;
+    const int height = grid_dimensions;
 
-    // No host-device synchronization here as it is assumed to be handled externally.
+    dim3 block(BX, BY, 1);
+    dim3 grid((width + BX - 1) / BX, (height + BY - 1) / BY, 1);
+
+    game_of_life_kernel_tiled<BX, BY><<<grid, block>>>(input, output, width, height);
 }
-
-// The content below was not generated by GPT; it was added to ensure the framework can compile the code.
-
-
-#include <cstdint>
-void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
-    (void)input;
-    (void)output;
-    (void)grid_dimensions;
-}
-
-void initialize_internal_data_structures(int grid_dimensions) {
-    (void)grid_dimensions;
-}
-// this label is used to identify the memory layout of the input and output arrays by the framework
-// MEMORY_LAYOUT: BOOLS

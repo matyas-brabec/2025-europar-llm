@@ -1,158 +1,183 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// In this implementation we assume that each 64‐bit word encodes 64 consecutive cells,
-// with bit index 0 representing the left‐edge cell of the word and bit index 63 representing the right‐edge cell.
-// Thus, for each cell, the left neighbor is cell index (i-1) (and if i==0 then from the previous word)
-// and the right neighbor is cell index (i+1) (and if i==63 then from the next word).
-//
-// Each CUDA thread processes one 64‐bit word (i.e. one word of 64 cells) from the grid.
-// The grid is logically arranged in rows, each row containing (grid_dimensions/64) words.
-// For a given word, we must consider the three rows: the one above, current, and below.
-// For each row, we load three words: the word itself, and its left/right neighbors (if available).
-// If a neighbor row or word does not exist (boundary), we treat it as all 0’s.
-// Then, for each bit position in the 64‐bit word, we compute the number of live neighbors
-// by reading the appropriate bit from the 9 surrounding words (3 from the row above, 2 from same row, 3 from row below).
-// The live/dead update is then computed as per Conway’s Game of Life rules:
-//    newState = (neighbors == 3) || (current && neighbors == 2) 
-// We use the __popc intrinsic to count bits set in an 8–bit mask that gathers the eight neighbor bits,
-// which can significantly improve performance relative to computing 8 separate additions.
+/*
+High-performance CUDA implementation of one step of Conway's Game of Life on a bit-packed grid.
 
+Key design decisions:
+- Bit-packed layout: each 64-bit word encodes a run of 64 horizontally adjacent cells in a row (LSB = leftmost bit).
+- One CUDA thread processes exactly one 64-bit word, avoiding atomics and enabling fully coalesced memory access.
+- No shared or texture memory: modern H100/A100 GPUs are bandwidth rich; coalesced global loads are efficient here.
+- Avoid per-cell loops: use a bit-sliced adder network (carry-save adders) to count neighbors for all 64 cells in parallel.
+  This computes 3 bitplanes (1,2,4) of the 0..8 neighbor count per bit without cross-bit carries.
+- Boundary handling: outside-the-grid cells are treated as dead. For horizontal neighbors, handle cross-word bit carries
+  explicitly by injecting the MSB/LSB from left/right words; for top/bottom rows, use zero.
+- Rule application: next = (neighbors == 3) | (alive & neighbors == 2)
 
-// Device helper function to extract bit from a 64-bit word at a given position.
-// Position is assumed to be in [0,63]. 0 corresponds to the leftmost cell (edge requiring special handling) 
-// and 63 corresponds to the rightmost cell.
-__device__ __forceinline__ int get_bit(std::uint64_t word, int pos) {
-    return int((word >> pos) & 1ULL);
+Notes on the adder network (per bit position, across 64 bits in parallel):
+- From 8 one-bit masks (N, S, E, W, NE, NW, SE, SW), we compute three binary digit planes of the neighbor count:
+  n1 (1's bit), n2 (2's bit), n4 (4's bit). The 8's bit is not needed for rules (==2 or ==3).
+- Using carry-save adders (CSA):
+    Let CSA(s, c, a, b, d) produce:
+      s = a ^ b ^ d
+      c = (a & b) | (a & d) | (b & d)   // per-bit "majority" (carry)
+    Level 1:
+      CSA(s10,c10, N, S, E)
+      CSA(s11,c11, W, NE, NW)
+      CSA(s12,c12, SE, SW, 0)
+    Level 2:
+      CSA(s20,c20, s10, s11, s12)   // sums of 1's
+      CSA(s21,c21, c10, c11, c12)   // sums of 2's
+    Final digit planes:
+      n1 = s20
+      n2 = s21 ^ c20
+      n4 = c21 ^ (s21 & c20)
+- Then:
+    mask2 = (n2 & ~n1 & ~n4)   // exactly 2 neighbors
+    mask3 = (n2 &  n1 & ~n4)   // exactly 3 neighbors
+    next  = mask3 | (alive & mask2)
+
+Performance considerations:
+- Each thread performs 9 coalesced 64-bit loads (current, left/right; up row left/center/right; down row left/center/right),
+  ~8 shifts, ~8 ors, and a fixed sequence of bitwise ops for the CSA tree. This is compute-bound and scales well.
+- The use of __popc/__popcll for per-cell counting is intentionally avoided; the CSA-based bit-sliced reduction is faster
+  and minimizes branch divergence and per-bit work.
+
+API:
+void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions);
+
+Assumptions:
+- grid_dimensions is a power of two, >= 512.
+- grid is square of size (grid_dimensions x grid_dimensions).
+- Each row contains (grid_dimensions / 64) 64-bit words.
+- Input and output device buffers are allocated with cudaMalloc.
+- Synchronization is performed by the caller.
+*/
+
+static __device__ __forceinline__ void csa(uint64_t& s, uint64_t& c,
+                                           const uint64_t a,
+                                           const uint64_t b,
+                                           const uint64_t d) {
+    // Carry-Save Adder: per-bit full adder across 64 lanes in parallel
+    const uint64_t ab = a ^ b;
+    s = ab ^ d;
+    c = (a & b) | (d & ab);
 }
 
-// CUDA kernel that computes one update step of Conway's Game of Life.
-__global__ void game_of_life_kernel(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
-    // Calculate number of 64-bit words per row.
-    const int words_per_row = grid_dimensions >> 6; // grid_dimensions/64
-
-    // Compute thread's position in terms of grid row and word column.
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int word_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Only proceed if within valid bounds.
-    if (row >= grid_dimensions || word_idx >= words_per_row)
-        return;
-
-    // Compute base index for the current row.
-    int row_base = row * words_per_row;
-
-    // Load the three adjacent words (current row): left, current, and right.
-    std::uint64_t mid = input[row_base + word_idx];
-    std::uint64_t mid_left = (word_idx > 0) ? input[row_base + word_idx - 1] : 0ULL;
-    std::uint64_t mid_right = (word_idx < words_per_row - 1) ? input[row_base + word_idx + 1] : 0ULL;
-
-    // For the top row (row-1), if exists load adjacent words; else use 0.
-    std::uint64_t top = 0ULL, top_left = 0ULL, top_right = 0ULL;
-    if (row > 0) {
-        int top_base = (row - 1) * words_per_row;
-        top = input[top_base + word_idx];
-        top_left = (word_idx > 0) ? input[top_base + word_idx - 1] : 0ULL;
-        top_right = (word_idx < words_per_row - 1) ? input[top_base + word_idx + 1] : 0ULL;
-    }
-
-    // For the bottom row (row+1), if exists load adjacent words; else use 0.
-    std::uint64_t bot = 0ULL, bot_left = 0ULL, bot_right = 0ULL;
-    if (row < grid_dimensions - 1) {
-        int bot_base = (row + 1) * words_per_row;
-        bot = input[bot_base + word_idx];
-        bot_left = (word_idx > 0) ? input[bot_base + word_idx - 1] : 0ULL;
-        bot_right = (word_idx < words_per_row - 1) ? input[bot_base + word_idx + 1] : 0ULL;
-    }
-
-    // Result word for the next generation.
-    std::uint64_t res = 0ULL;
-
-    // Process each of the 64 cells in the current word.
-    // We treat bits [0,63] directly. For each cell at bit position i:
-    //   - For horizontal neighbors, if i == 0 the left neighbor comes from the left-adjacent word,
-    //     and if i == 63 the right neighbor comes from the right-adjacent word.
-    //   - Similarly for top and bottom rows.
-    for (int i = 0; i < 64; i++) {
-        // Build an 8-bit mask representing the eight neighbor cells.
-        // Bit positions in the mask:
-        //   bit0: top-left
-        //   bit1: top
-        //   bit2: top-right
-        //   bit3: left   (same row)
-        //   bit4: right  (same row)
-        //   bit5: bottom-left
-        //   bit6: bottom
-        //   bit7: bottom-right
-
-        int tl = (i == 0) ? get_bit(top_left, 63) : get_bit(top, i - 1);
-        int t  = get_bit(top, i); // top cell
-        int tr = (i == 63) ? get_bit(top_right, 0) : get_bit(top, i + 1);
-
-        int l  = (i == 0) ? get_bit(mid_left, 63) : get_bit(mid, i - 1);
-        int r  = (i == 63) ? get_bit(mid_right, 0) : get_bit(mid, i + 1);
-
-        int bl = (i == 0) ? get_bit(bot_left, 63) : get_bit(bot, i - 1);
-        int b  = get_bit(bot, i);
-        int br = (i == 63) ? get_bit(bot_right, 0) : get_bit(bot, i + 1);
-
-        // Pack all eight neighbor bits into a single 32-bit integer.
-        int neighbor_bits = (tl << 0) | (t  << 1) | (tr << 2) |
-                            (l  << 3) | (r  << 4) |
-                            (bl << 5) | (b  << 6) | (br << 7);
-
-        // Use __popc to count the number of live neighbors.
-        int live_neighbors = __popc(neighbor_bits);
-
-        // Get the current cell state from the middle word.
-        int current = get_bit(mid, i);
-
-        // Compute the next state according to Conway's Game of Life rules:
-        //   - A dead cell with exactly 3 live neighbors becomes live.
-        //   - A live cell with 2 or 3 live neighbors survives (otherwise dies).
-        int next_state = (live_neighbors == 3) || (current && (live_neighbors == 2));
-
-        // Set the corresponding bit in our result word if next_state is live.
-        if (next_state)
-            res |= (1ULL << i);
-    }
-
-    // Write the computed result for this word to the output grid.
-    output[row_base + word_idx] = res;
+static __device__ __forceinline__ uint64_t shift_east(const uint64_t center, const uint64_t right) {
+    // For each target bit i, set bit i if the cell at (i+1) (east neighbor) is alive.
+    // Achieved by shifting the source row right by 1 and injecting the LSB of 'right' into MSB.
+    return (center >> 1) | (right << 63); // right<<63 moves bit0 of 'right' into bit63.
 }
 
-// Host function that runs one simulation step of Conway's Game of Life on the GPU.
-// 'input' and 'output' are pointers to device memory, where each std::uint64_t element is bit-packed
-// representing 64 cells. 'grid_dimensions' is the width and height of the square grid.
-/// @FIXED: extern "C" void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions)
-void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions)
-{
-    // Number of 64-bit words per row.
-    int words_per_row = grid_dimensions >> 6;  // grid_dimensions / 64
-
-    // Set a block size. We choose a 16x16 thread block.
-    dim3 blockDim(16, 16);
-
-    // The grid dimensions: x dimension over the words per row, y dimension over the grid rows.
-    dim3 gridDim((words_per_row + blockDim.x - 1) / blockDim.x,
-                 (grid_dimensions + blockDim.y - 1) / blockDim.y);
-
-    // Launch the kernel.
-    game_of_life_kernel<<<gridDim, blockDim>>>(input, output, grid_dimensions);
+static __device__ __forceinline__ uint64_t shift_west(const uint64_t center, const uint64_t left) {
+    // For each target bit i, set bit i if the cell at (i-1) (west neighbor) is alive.
+    // Achieved by shifting the source row left by 1 and injecting the MSB of 'left' into LSB.
+    return (center << 1) | (left >> 63); // left>>63 moves bit63 of 'left' into bit0.
 }
 
-// The content below was not generated by GPT; it was added to ensure the framework can compile the code.
+__global__ void life_kernel_bitpacked(const std::uint64_t* __restrict__ in,
+                                      std::uint64_t* __restrict__ out,
+                                      int grid_dim) {
+    const int words_per_row = grid_dim >> 6; // grid_dim / 64; grid_dim is a power of two
+    const int total_words = words_per_row * grid_dim;
 
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_words) return;
 
-void run_game_of_life(const bool* input, bool* output, int grid_dimensions) {
-    (void)input;
-    (void)output;
-    (void)grid_dimensions;
+    // Compute 2D position in word coordinates
+    const int y = idx / words_per_row;
+    const int x = idx - y * words_per_row;
+
+    // Row base pointers for current, above, and below rows
+    const std::uint64_t* rowC = in + static_cast<std::size_t>(y) * words_per_row;
+    const std::uint64_t* rowU = (y > 0) ? (in + static_cast<std::size_t>(y - 1) * words_per_row) : nullptr;
+    const std::uint64_t* rowD = (y + 1 < grid_dim) ? (in + static_cast<std::size_t>(y + 1) * words_per_row) : nullptr;
+
+    // Load current row words (center, left, right)
+    const bool hasL = (x > 0);
+    const bool hasR = (x + 1 < words_per_row);
+
+    const uint64_t mC = rowC[x];
+    const uint64_t mL = hasL ? rowC[x - 1] : 0ull;
+    const uint64_t mR = hasR ? rowC[x + 1] : 0ull;
+
+    // Load above row words (center, left, right), or zero at grid boundary
+    const uint64_t uC = rowU ? rowU[x] : 0ull;
+    const uint64_t uL = (rowU && hasL) ? rowU[x - 1] : 0ull;
+    const uint64_t uR = (rowU && hasR) ? rowU[x + 1] : 0ull;
+
+    // Load below row words (center, left, right), or zero at grid boundary
+    const uint64_t dC = rowD ? rowD[x] : 0ull;
+    const uint64_t dL = (rowD && hasL) ? rowD[x - 1] : 0ull;
+    const uint64_t dR = (rowD && hasR) ? rowD[x + 1] : 0ull;
+
+    // Build neighbor masks for the 8 directions (per-bit neighbor presence)
+    const uint64_t N  = uC;
+    const uint64_t S  = dC;
+    const uint64_t E  = shift_east(mC, mR);
+    const uint64_t W  = shift_west(mC, mL);
+    const uint64_t NE = shift_east(uC, uR);
+    const uint64_t NW = shift_west(uC, uL);
+    const uint64_t SE = shift_east(dC, dR);
+    const uint64_t SW = shift_west(dC, dL);
+
+    // Carry-save adder tree to compute digit planes (n1,n2,n4) of the 0..8 neighbor count per bit
+    uint64_t s10, c10;
+    uint64_t s11, c11;
+    uint64_t s12, c12;
+
+    csa(s10, c10, N,  S,  E);
+    csa(s11, c11, W,  NE, NW);
+    csa(s12, c12, SE, SW, 0ull);
+
+    uint64_t s20, c20;
+    uint64_t s21, c21;
+
+    csa(s20, c20, s10, s11, s12);   // sums of 1's (LSB plane and carry->2's)
+    csa(s21, c21, c10, c11, c12);   // sums of 2's (LSB plane and carry->4's)
+
+    // Neighbor count digit planes:
+    // n1 = s20
+    // n2 = s21 ^ c20
+    // n4 = c21 ^ (s21 & c20)
+    const uint64_t n1 = s20;
+    const uint64_t n2 = s21 ^ c20;
+    const uint64_t n4 = c21 ^ (s21 & c20);
+
+    // Masks for exactly 2 and exactly 3 neighbors (no need to handle 8 specifically; n2=0 there)
+    const uint64_t mask2 = (n2 & ~n1 & ~n4); // 010
+    const uint64_t mask3 = (n2 &  n1 & ~n4); // 011
+
+    // Current cell state
+    const uint64_t alive = mC;
+
+    // Next state: birth on 3; survive on 2
+    const uint64_t next = mask3 | (alive & mask2);
+
+    out[idx] = next;
 }
 
-void initialize_internal_data_structures(int grid_dimensions) {
-    (void)grid_dimensions;
-}
+void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
+    /*
+    Executes one generation step of Conway's Game of Life on a square, bit-packed grid.
 
-// This label is used by the framework to identify the memory layout of the input and output arrays.
-// MEMORY_LAYOUT: ROWS
+    Parameters:
+    - input:  device pointer to the current grid (bit-packed: 1 bit per cell, 64 cells per uint64_t)
+    - output: device pointer to store the next generation (same packing)
+    - grid_dimensions: width and height of the square grid (power of two, >= 512)
+
+    Notes:
+    - Each CUDA thread computes the next state for exactly one 64-bit word (64 adjacent horizontal cells).
+    - No synchronization is performed here; the caller must handle it if needed.
+    */
+    const int words_per_row = grid_dimensions >> 6; // grid_dimensions / 64
+    const int total_words = words_per_row * grid_dimensions;
+
+    // Choose a launch configuration that balances occupancy and register usage.
+    // 256 threads per block works well on modern data center GPUs.
+    constexpr int threads_per_block = 256;
+    const int blocks = (total_words + threads_per_block - 1) / threads_per_block;
+
+    life_kernel_bitpacked<<<blocks, threads_per_block>>>(input, output, grid_dimensions);
+}

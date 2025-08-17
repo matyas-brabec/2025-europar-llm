@@ -1,137 +1,175 @@
+// CUDA implementation of Conway's Game of Life optimized for modern NVIDIA GPUs (A100/H100).
+// Key optimizations:
+// - 2D tiling with shared memory and a 1-cell halo to minimize global memory traffic.
+// - Coalesced global memory accesses for the interior of the tile and for top/bottom halos.
+// - Minimal conditional logic (boundary checks only on the halo loads).
+// - Block dimensions chosen to align with warp size and typical SM scheduling.
+//
+// Assumptions from the problem statement:
+// - input and output are device pointers allocated with cudaMalloc.
+// - Grid is square with dimensions N x N, where N is a power of 2 (> 512). Thus, N is divisible by 32 and 16.
+// - Cells outside the grid are considered dead (0).
+// - run_game_of_life launches a single step (one generation) of the simulation.
+// - Caller handles synchronization; this function only launches the kernel.
+
 #include <cuda_runtime.h>
-// Define the block (tile) size for the kernel.
-// We choose 32 because modern GPUs (A100, H100) perform well with 32x32 thread blocks.
-#define BLOCK_SIZE 32
+#include <stdint.h>
 
-// The CUDA kernel that computes one step of Conway’s Game of Life.
-// The implementation uses shared memory tiling to minimize global memory accesses.
-// Each block loads a (BLOCK_SIZE x BLOCK_SIZE) tile from the global input grid
-// plus a 1-cell wide halo on all sides. Each cell’s eight neighbors are then summed
-// using the shared memory tile. The Game of Life rules are applied and the result
-// is stored in the output grid.
-__global__ void game_of_life_kernel(const bool* __restrict__ input,
-                                    bool* __restrict__ output,
-                                    int grid_dim)
+// Tuned block dimensions:
+// - X dimension is 32 to match a warp for maximal coalescing on row-wise loads.
+// - Y dimension is 16 to provide 512 threads/block and good occupancy on A100/H100.
+#ifndef GOL_BLOCK_DIM_X
+#define GOL_BLOCK_DIM_X 32
+#endif
+
+#ifndef GOL_BLOCK_DIM_Y
+#define GOL_BLOCK_DIM_Y 16
+#endif
+
+// Kernel implements one Game of Life step using shared-memory tiling.
+// Pointers are marked __restrict__ to aid compiler alias analysis.
+// The input pointer is treated as read-only; the compiler will often route through the read-only cache.
+__launch_bounds__(GOL_BLOCK_DIM_X * GOL_BLOCK_DIM_Y, 2)
+__global__ void game_of_life_kernel_shared(const bool* __restrict__ input,
+                                           bool* __restrict__ output,
+                                           int N)
 {
-    // Allocate shared memory for a tile of cells, including a 1-cell halo on each side.
-    // The shared tile dimensions are (BLOCK_SIZE+2) x (BLOCK_SIZE+2).
-    __shared__ unsigned char tile[BLOCK_SIZE + 2][BLOCK_SIZE + 2];
+    // Shared memory tile with 1-cell halo on all sides.
+    // Using unsigned char for compact per-cell storage (bools map to 0/1).
+    __shared__ unsigned char tile[GOL_BLOCK_DIM_Y + 2][GOL_BLOCK_DIM_X + 2];
 
-    // Compute the global (x,y) index of the cell this thread is working on.
-    int gx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    int gy = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+    // Local thread indices and global coordinates.
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
 
-    // The local index inside the shared memory tile. Offset by 1 to account for the halo.
-    int lx = threadIdx.x + 1;
-    int ly = threadIdx.y + 1;
+    const int gx = blockIdx.x * GOL_BLOCK_DIM_X + tx;
+    const int gy = blockIdx.y * GOL_BLOCK_DIM_Y + ty;
 
-    // Load the cell corresponding to (gx,gy) into the interior of the shared memory tile.
-    // If the global index is out-of-bounds (should not happen for full blocks in a power-of-2 grid),
-    // then load a dead cell (0).
-    tile[ly][lx] = (gx < grid_dim && gy < grid_dim && input[gy * grid_dim + gx]) ? 1 : 0;
+    const int lx = tx + 1; // +1 accounts for halo
+    const int ly = ty + 1;
 
-    // Load horizontal halo cells.
-    // Left halo: load the cell immediately to the left of the current tile row.
-    if (threadIdx.x == 0) {
-        int gx_left = gx - 1;
-        tile[ly][0] = (gx_left >= 0 && gx_left < grid_dim && gy < grid_dim && gy >= 0) ? (input[gy * grid_dim + gx_left] ? 1 : 0) : 0;
-    }
-    // Right halo: load the cell immediately to the right.
-    if (threadIdx.x == BLOCK_SIZE - 1) {
-        int gx_right = gx + 1;
-        tile[ly][BLOCK_SIZE + 1] = (gx_right < grid_dim && gx_right >= 0 && gy < grid_dim && gy >= 0) ? (input[gy * grid_dim + gx_right] ? 1 : 0) : 0;
-    }
+    // Cast input/output to byte-addressable views for efficient loads/stores.
+    const unsigned char* __restrict__ in  = reinterpret_cast<const unsigned char*>(input);
+    unsigned char* __restrict__ out = reinterpret_cast<unsigned char*>(output);
 
-    // Load vertical halo cells.
-    // Top halo: load the cell immediately above.
-    if (threadIdx.y == 0) {
-        int gy_top = gy - 1;
-        tile[0][lx] = (gy_top >= 0 && gy_top < grid_dim && gx < grid_dim && gx >= 0) ? (input[gy_top * grid_dim + gx] ? 1 : 0) : 0;
-    }
-    // Bottom halo: load the cell immediately below.
-    if (threadIdx.y == BLOCK_SIZE - 1) {
-        int gy_bottom = gy + 1;
-        tile[BLOCK_SIZE + 1][lx] = (gy_bottom < grid_dim && gy_bottom >= 0 && gx < grid_dim && gx >= 0) ? (input[gy_bottom * grid_dim + gx] ? 1 : 0) : 0;
-    }
+    // The following loads are structured for coalescing:
+    // - Interior tile load: all threads load their corresponding cell (fully coalesced along x).
+    // - Top/bottom halos: loaded by threads with ty==0 or ty==BLOCK_Y-1 (coalesced along x).
+    // - Left/right halos: loaded by threads with tx==0 or tx==BLOCK_X-1 (strided in y, but only 2*BLOCK_Y loads).
 
-    // Load the four corner halo cells.
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        int gx_tl = gx - 1;
-        int gy_tl = gy - 1;
-        tile[0][0] = (gx_tl >= 0 && gy_tl >= 0 && gx_tl < grid_dim && gy_tl < grid_dim) ? (input[gy_tl * grid_dim + gx_tl] ? 1 : 0) : 0;
+    // Load interior cell into shared memory (always in-bounds because N is divisible by block dims).
+    // Still keep a check for robustness if used with arbitrary sizes.
+    unsigned char center = 0;
+    if (gx < N && gy < N) {
+        // Use __ldg to prefer read-only caching where beneficial on supported architectures.
+        center = __ldg(in + (size_t)gy * N + gx);
     }
-    if (threadIdx.x == BLOCK_SIZE - 1 && threadIdx.y == 0) {
-        int gx_tr = gx + 1;
-        int gy_tr = gy - 1;
-        tile[0][BLOCK_SIZE + 1] = (gx_tr < grid_dim && gy_tr >= 0 && gx_tr >= 0 && gy_tr < grid_dim) ? (input[gy_tr * grid_dim + gx_tr] ? 1 : 0) : 0;
-    }
-    if (threadIdx.x == 0 && threadIdx.y == BLOCK_SIZE - 1) {
-        int gx_bl = gx - 1;
-        int gy_bl = gy + 1;
-        tile[BLOCK_SIZE + 1][0] = (gx_bl >= 0 && gy_bl < grid_dim && gy_bl >= 0 && gx_bl < grid_dim) ? (input[gy_bl * grid_dim + gx_bl] ? 1 : 0) : 0;
-    }
-    if (threadIdx.x == BLOCK_SIZE - 1 && threadIdx.y == BLOCK_SIZE - 1) {
-        int gx_br = gx + 1;
-        int gy_br = gy + 1;
-        tile[BLOCK_SIZE + 1][BLOCK_SIZE + 1] = (gx_br < grid_dim && gy_br < grid_dim) ? (input[gy_br * grid_dim + gx_br] ? 1 : 0) : 0;
+    tile[ly][lx] = center;
+
+    // Left halo (x-1)
+    if (tx == 0) {
+        unsigned char val = 0;
+        if (gx > 0 && gy < N) {
+            val = __ldg(in + (size_t)gy * N + (gx - 1));
+        }
+        tile[ly][0] = val;
     }
 
-    // Ensure all threads have loaded their part of the tile (including halo) before computing.
+    // Right halo (x+1)
+    if (tx == (GOL_BLOCK_DIM_X - 1)) {
+        unsigned char val = 0;
+        if ((gx + 1) < N && gy < N) {
+            val = __ldg(in + (size_t)gy * N + (gx + 1));
+        }
+        tile[ly][GOL_BLOCK_DIM_X + 1] = val;
+    }
+
+    // Top halo (y-1)
+    if (ty == 0) {
+        unsigned char val = 0;
+        if (gy > 0 && gx < N) {
+            val = __ldg(in + (size_t)(gy - 1) * N + gx);
+        }
+        tile[0][lx] = val;
+    }
+
+    // Bottom halo (y+1)
+    if (ty == (GOL_BLOCK_DIM_Y - 1)) {
+        unsigned char val = 0;
+        if ((gy + 1) < N && gx < N) {
+            val = __ldg(in + (size_t)(gy + 1) * N + gx);
+        }
+        tile[GOL_BLOCK_DIM_Y + 1][lx] = val;
+    }
+
+    // Corner halos:
+    if (tx == 0 && ty == 0) {
+        unsigned char val = 0;
+        if (gx > 0 && gy > 0) {
+            val = __ldg(in + (size_t)(gy - 1) * N + (gx - 1));
+        }
+        tile[0][0] = val;
+    }
+
+    if (tx == (GOL_BLOCK_DIM_X - 1) && ty == 0) {
+        unsigned char val = 0;
+        if ((gx + 1) < N && gy > 0) {
+            val = __ldg(in + (size_t)(gy - 1) * N + (gx + 1));
+        }
+        tile[0][GOL_BLOCK_DIM_X + 1] = val;
+    }
+
+    if (tx == 0 && ty == (GOL_BLOCK_DIM_Y - 1)) {
+        unsigned char val = 0;
+        if (gx > 0 && (gy + 1) < N) {
+            val = __ldg(in + (size_t)(gy + 1) * N + (gx - 1));
+        }
+        tile[GOL_BLOCK_DIM_Y + 1][0] = val;
+    }
+
+    if (tx == (GOL_BLOCK_DIM_X - 1) && ty == (GOL_BLOCK_DIM_Y - 1)) {
+        unsigned char val = 0;
+        if ((gx + 1) < N && (gy + 1) < N) {
+            val = __ldg(in + (size_t)(gy + 1) * N + (gx + 1));
+        }
+        tile[GOL_BLOCK_DIM_Y + 1][GOL_BLOCK_DIM_X + 1] = val;
+    }
+
     __syncthreads();
 
-    // Compute the sum of the eight neighbors around the cell at (lx, ly) using the shared tile.
-    int neighbors = tile[ly - 1][lx - 1] + tile[ly - 1][lx] + tile[ly - 1][lx + 1] +
-                    tile[ly][lx - 1]                   +          tile[ly][lx + 1] +
-                    tile[ly + 1][lx - 1] + tile[ly + 1][lx] + tile[ly + 1][lx + 1];
+    // Compute next state if within bounds.
+    if (gx < N && gy < N) {
+        // Neighbor sum calculation using shared memory. We do not include the center cell.
+        // Access pattern uses the halo to avoid conditionals for edges.
+        const int lx0 = lx - 1, lx1 = lx, lx2 = lx + 1;
+        const int ly0 = ly - 1, ly2 = ly + 1;
 
-    // Apply Conway's Game of Life rules.
-    // If the cell is alive (non-zero) it survives with 2 or 3 live neighbors;
-    // otherwise it dies. If the cell is dead, it becomes alive only with exactly 3 live neighbors.
-    bool current = tile[ly][lx] != 0;
-    bool next_state = false;
-    if (current) {
-        next_state = (neighbors == 2 || neighbors == 3);
-    } else {
-        next_state = (neighbors == 3);
-    }
+        // Sum 8 neighbors: three from row above, two from current row (left/right), three from row below.
+        int nsum = 0;
+        nsum += tile[ly0][lx0] + tile[ly0][lx1] + tile[ly0][lx2];
+        nsum += tile[ly][lx0]                 +                tile[ly][lx2];
+        nsum += tile[ly2][lx0] + tile[ly2][lx1] + tile[ly2][lx2];
 
-    // Write the computed next state to the global output grid.
-    if (gx < grid_dim && gy < grid_dim) {
-        output[gy * grid_dim + gx] = next_state;
+        const unsigned char cur = tile[ly][lx];
+        const unsigned char next = (nsum == 3) | (cur & (nsum == 2));
+
+        out[(size_t)gy * N + gx] = next;
     }
 }
 
-// Host function that runs one iteration (step) of Conway’s Game of Life.
-// It sets up the CUDA kernel launch parameters and calls the game_of_life_kernel.
-// The input and output pointers are assumed to be allocated in GPU memory (via cudaMalloc).
-// This function only launches the kernel; any necessary host-device synchronization
-// is assumed to be handled by the caller.
+// Host function that launches one step of Conway's Game of Life.
+// input:  device pointer to N*N bools representing the current grid.
+// output: device pointer to N*N bools to receive the next grid.
+// N:      grid dimensions (width == height), power of 2 > 512.
 void run_game_of_life(const bool* input, bool* output, int grid_dimensions)
 {
-    // Calculate grid and block dimensions.
-    // We use BLOCK_SIZE x BLOCK_SIZE threads per block.
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((grid_dimensions + BLOCK_SIZE - 1) / BLOCK_SIZE,
-              (grid_dimensions + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const int N = grid_dimensions;
 
-    // Launch the CUDA kernel.
-    game_of_life_kernel<<<grid, block>>>(input, output, grid_dimensions);
+    // Grid configuration. Because N is a power of 2 and > 512, it is divisible by these block dims.
+    dim3 block(GOL_BLOCK_DIM_X, GOL_BLOCK_DIM_Y);
+    dim3 grid((N + GOL_BLOCK_DIM_X - 1) / GOL_BLOCK_DIM_X,
+              (N + GOL_BLOCK_DIM_Y - 1) / GOL_BLOCK_DIM_Y);
 
-    // Note: Error checking and synchronization (if required) should be handled by the caller.
+    // Launch the kernel. No explicit synchronization here; caller handles it.
+    game_of_life_kernel_shared<<<grid, block>>>(input, output, N);
 }
-
-// The content below was not generated by GPT; it was added to ensure the framework can compile the code.
-
-
-#include <cstdint>
-void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
-    (void)input;
-    (void)output;
-    (void)grid_dimensions;
-}
-
-void initialize_internal_data_structures(int grid_dimensions) {
-    (void)grid_dimensions;
-}
-// this label is used to identify the memory layout of the input and output arrays by the framework
-// MEMORY_LAYOUT: BOOLS
