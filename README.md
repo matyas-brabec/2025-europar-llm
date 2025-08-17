@@ -2,6 +2,8 @@
 
 [![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![zenodo](https://img.shields.io/badge/zenodo-10.5281/zenodo.15580207-blue)](https://doi.org/10.5281/zenodo.15580207) [![DOI](https://img.shields.io/badge/DOI-TODO-blue)](todo)
 
+> For the presented results, see the [main](https://github.com/matyas-brabec/2025-europar-llm/tree/main) branch of this repository. This branch contains replication of the experiments with a newer language model, `gpt-5-2025-08-07`. This branch does not include the original experiments with `o3-mini-2025-01-31` and, most notably, the interactive prompting scenarios and detailed review of the implementations in [results](./results).
+
 This repository contains the replication package for the paper titled *"Tutoring LLM into a Better CUDA Optimizer"* presented at Euro-Par 2025.
 
 ```bibtex
@@ -21,11 +23,10 @@ To navigate this repository more easily, here is an index:
 | ⚙️ Managing Code | The main folder for managing the implementation of three provided test cases (*histogram*, *Game of Life*, and *k-NN*) is in the [~/framework](./framework) directory. For further information, read the [README](./framework/README.md) inside. |
 | | The subdirectories [~/framework/histogram](./framework/histogram/), [~/framework/game-of-life](./framework/game-of-life/), and [~/framework/knn](./framework/knn/) contain the respective test cases. Each has a `<Hist\|GoL\|kNN>/reference` subfolder with reference solutions. |
 | 🔗 Open API | The code managing calls to OpenAI's ChatGPT is located in [~/gpt-querying](./gpt-querying/) along with a [README](./gpt-querying/README.md). |
-| 💬 Interactive Prompting | All data related to interactive prompting is in [~/interactive-scenarios](./interactive-scenarios/), including scripts for each problem, resulting source files, and some notes. |
 | ✍️ Single-Response Prompts | All prompts are in the [~/prompts](./prompts/) folder. Apart from the prompt files (`.prompt.md`), it also contains common parts that can be included in prompts. |
 | 🤖 Generated "Single-Response" Sources | Generated code in the *"Single-Response"* mode is in [~/results](./results/). Individual solutions for each prompt and its 10 attempts are in [~/results/histogram](./results/histogram/), [~/results/gol](./results/gol/), and [~/results/knn](./results/knn/). |
 | 🧐 Reviews | Code reviews for *"Single-Response"* generated code are in the [~/reviews](./reviews/) directory. |
-| 📊 Measurements | Code measurements for tested architectures (`Ampere`, `Volta`, and `Hopper`) are in [~/measured-times](./measured-times/). The format is CSV. For each architecture and problem, there are three CSVs: one for *"Single-Response"* codes, one for reference solutions, and one for interactive prompting. The pre-generated graphs are located in [~/measured-times/graphs](./measured-times/graphs/). |
+| 📊 Measurements | Code measurements for tested architectures (`Ampere`, `Volta`, and `Hopper`) are in [~/measured-times](./measured-times/). The format is CSV. For each architecture and problem, there are two CSVs: one for *"Single-Response"* codes, and one for reference solutions. The pre-generated graphs are located in [~/measured-times/graphs](./measured-times/graphs/). |
 
 ## Tutorial 🚀
 
