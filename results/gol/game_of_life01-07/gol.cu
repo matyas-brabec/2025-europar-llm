@@ -1,120 +1,122 @@
 #include <cuda_runtime.h>
+#include <stdint.h>
 
-// Optimized CUDA kernel for one simulation step of Conway's Game of Life.
-// This kernel uses a shared-memory tiling technique to minimize global memory accesses.
-// Each CUDA block loads a tile of the grid into shared memory along with a 1-cell-wide halo.
-__global__ void game_of_life_kernel(const bool* __restrict__ d_input, bool* __restrict__ d_output, int grid_dim)
+/*
+  High-performance CUDA implementation of one step of Conway's Game of Life.
+
+  Key optimizations:
+  - Tiling with shared memory and a 1-cell halo reduces global memory traffic from 8 loads per cell to ~1 load per cell.
+  - Block size of 32x32 threads aligns with warp size and the problem guarantee (grid dimension is a power of 2 > 512),
+    ensuring the grid is exactly covered by blocks with no partial edge blocks. This avoids bounds checks on interior loads/stores.
+  - Memory is treated as 8-bit (unsigned char) for compactness and efficient shared memory usage.
+  - All out-of-grid neighbors are treated as dead (0) by explicit boundary checks when loading halo cells.
+
+  Assumptions (per problem statement):
+  - The grid is square with size N x N where N is a power of 2 and N > 512.
+  - Input and output arrays are device pointers allocated via cudaMalloc.
+  - Caller handles any necessary synchronization.
+*/
+
+template<int BLOCK_X, int BLOCK_Y>
+__global__ void game_of_life_kernel(const bool* __restrict__ input,
+                                    bool* __restrict__ output,
+                                    int width)
 {
-    // Define block dimensions and compute block's starting indices in the global grid.
-    // Each block processes a blockDim.x x blockDim.y segment of the grid.
-    const int bx = blockDim.x;
-    const int by = blockDim.y;
-    const int blockStartX = blockIdx.x * bx;
-    const int blockStartY = blockIdx.y * by;
+    // Reinterpret to 8-bit pointers for efficient arithmetic and shared memory use.
+    const unsigned char* __restrict__ in  = reinterpret_cast<const unsigned char*>(input);
+    unsigned char* __restrict__ out = reinterpret_cast<unsigned char*>(output);
 
-    // Global coordinates for this thread's corresponding cell.
-    const int globalX = blockStartX + threadIdx.x;
-    const int globalY = blockStartY + threadIdx.y;
+    // Thread's global coordinates
+    const int x = blockIdx.x * BLOCK_X + threadIdx.x;
+    const int y = blockIdx.y * BLOCK_Y + threadIdx.y;
 
-    // Shared memory tile dimensions with a 1-cell halo on each side.
-    const int sh_w = bx + 2;
-    const int sh_h = by + 2;
+    // Shared memory tile with 1-cell halo on all sides.
+    // Layout: (BLOCK_Y + 2) rows x (BLOCK_X + 2) columns
+    __shared__ unsigned char tile[(BLOCK_Y + 2) * (BLOCK_X + 2)];
+    const int tile_pitch = BLOCK_X + 2;     // stride between shared-memory rows
 
-    // Declare shared memory array.
-    extern __shared__ bool s_data[];
+    // Thread's coordinates within the shared-memory tile (offset by +1 for halo).
+    const int lx = threadIdx.x + 1;
+    const int ly = threadIdx.y + 1;
+    const int s_index = ly * tile_pitch + lx;
 
-    // Each thread cooperatively loads data into shared memory.
-    // We use a linearized iteration so that all the (bx+2) * (by+2) elements are loaded.
-    const int total_shared_elements = sh_w * sh_h;
-    const int threadId = threadIdx.y * bx + threadIdx.x;
-    const int blockThreads = bx * by;
-    for (int idx = threadId; idx < total_shared_elements; idx += blockThreads)
-    {
-        // Compute shared memory (x,y) coordinates.
-        int s_x = idx % sh_w;
-        int s_y = idx / sh_w;
-        // Compute corresponding global coordinates.
-        int g_x = blockStartX + s_x - 1;
-        int g_y = blockStartY + s_y - 1;
-        // Only load from global memory if within grid bounds; otherwise, treat as dead.
-        if (g_x >= 0 && g_x < grid_dim && g_y >= 0 && g_y < grid_dim)
-            s_data[idx] = d_input[g_y * grid_dim + g_x];
-        else
-            s_data[idx] = false;
+    // Center cell: always in-bounds because width is a power of two > 512 and BLOCK dims divide width.
+    tile[s_index] = __ldg(&in[y * width + x]);
+
+    // Load halo cells cooperatively. Out-of-grid neighbors are treated as dead (0).
+    // Top halo
+    if (threadIdx.y == 0) {
+        tile[0 * tile_pitch + lx] = (y > 0) ? __ldg(&in[(y - 1) * width + x]) : 0;
     }
-    // Ensure all threads have loaded the data into shared memory.
+    // Bottom halo
+    if (threadIdx.y == BLOCK_Y - 1) {
+        tile[(BLOCK_Y + 1) * tile_pitch + lx] = (y < width - 1) ? __ldg(&in[(y + 1) * width + x]) : 0;
+    }
+    // Left halo
+    if (threadIdx.x == 0) {
+        tile[ly * tile_pitch + 0] = (x > 0) ? __ldg(&in[y * width + (x - 1)]) : 0;
+    }
+    // Right halo
+    if (threadIdx.x == BLOCK_X - 1) {
+        tile[ly * tile_pitch + (BLOCK_X + 1)] = (x < width - 1) ? __ldg(&in[y * width + (x + 1)]) : 0;
+    }
+
+    // Corner halos
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        tile[0 * tile_pitch + 0] = (x > 0 && y > 0) ? __ldg(&in[(y - 1) * width + (x - 1)]) : 0;
+    }
+    if (threadIdx.x == BLOCK_X - 1 && threadIdx.y == 0) {
+        tile[0 * tile_pitch + (BLOCK_X + 1)] = (x < width - 1 && y > 0) ? __ldg(&in[(y - 1) * width + (x + 1)]) : 0;
+    }
+    if (threadIdx.x == 0 && threadIdx.y == BLOCK_Y - 1) {
+        tile[(BLOCK_Y + 1) * tile_pitch + 0] = (x > 0 && y < width - 1) ? __ldg(&in[(y + 1) * width + (x - 1)]) : 0;
+    }
+    if (threadIdx.x == BLOCK_X - 1 && threadIdx.y == BLOCK_Y - 1) {
+        tile[(BLOCK_Y + 1) * tile_pitch + (BLOCK_X + 1)] =
+            (x < width - 1 && y < width - 1) ? __ldg(&in[(y + 1) * width + (x + 1)]) : 0;
+    }
+
     __syncthreads();
 
-    // Only process valid global cells.
-    if (globalX < grid_dim && globalY < grid_dim)
-    {
-        // Compute the shared memory index for this thread's cell.
-        const int s_center_x = threadIdx.x + 1;
-        const int s_center_y = threadIdx.y + 1;
-        const int s_index = s_center_y * sh_w + s_center_x;
+    // Sum the 8 neighbors from the shared-memory tile.
+    const int up_row    = (ly - 1) * tile_pitch;
+    const int mid_row   = ly * tile_pitch;
+    const int down_row  = (ly + 1) * tile_pitch;
+    const int left_col  = lx - 1;
+    const int right_col = lx + 1;
 
-        // Unroll the neighbor summation for performance.
-        int live_neighbors = 0;
-        live_neighbors += s_data[s_index - sh_w - 1]; // top-left
-        live_neighbors += s_data[s_index - sh_w];     // top
-        live_neighbors += s_data[s_index - sh_w + 1];   // top-right
-        live_neighbors += s_data[s_index - 1];          // left
-        live_neighbors += s_data[s_index + 1];          // right
-        live_neighbors += s_data[s_index + sh_w - 1];     // bottom-left
-        live_neighbors += s_data[s_index + sh_w];         // bottom
-        live_neighbors += s_data[s_index + sh_w + 1];     // bottom-right
+    int neighbors = 0;
+    neighbors += tile[up_row + left_col];
+    neighbors += tile[up_row + lx];
+    neighbors += tile[up_row + right_col];
+    neighbors += tile[mid_row + left_col];
+    neighbors += tile[mid_row + right_col];
+    neighbors += tile[down_row + left_col];
+    neighbors += tile[down_row + lx];
+    neighbors += tile[down_row + right_col];
 
-        // Apply Conway's rules.
-        bool current_alive = s_data[s_index];
-        bool next_state = false;
-        if (current_alive)
-        {
-            // Alive cell survives only if it has 2 or 3 live neighbors.
-            next_state = (live_neighbors == 2 || live_neighbors == 3);
-        }
-        else
-        {
-            // Dead cell becomes alive if it has exactly 3 live neighbors.
-            next_state = (live_neighbors == 3);
-        }
+    // Apply Conway's rules.
+    const unsigned char current = tile[s_index];
+    const unsigned char next = (current ? (neighbors == 2 || neighbors == 3) : (neighbors == 3)) ? 1 : 0;
 
-        // Write the computed state to the output grid.
-        d_output[globalY * grid_dim + globalX] = next_state;
-    }
+    // Store result.
+    out[y * width + x] = next;
 }
 
-// Host function that executes one step of Conway's Game of Life.
-// 'input'  - device pointer to the input grid (each cell is stored as bool).
-// 'output' - device pointer to the output grid (each cell is stored as bool).
-// 'grid_dimensions' - the width (and height) of the square grid.
 void run_game_of_life(const bool* input, bool* output, int grid_dimensions)
 {
-    // Choose a block size of 32x32 threads for optimum occupancy on modern GPUs.
-    const dim3 blockDim(32, 32);
-    // Compute grid dimensions to cover the entire grid.
-    const dim3 gridDim((grid_dimensions + blockDim.x - 1) / blockDim.x,
-                       (grid_dimensions + blockDim.y - 1) / blockDim.y);
+    // Using 32x32 blocks:
+    // - 1024 threads per block, good occupancy on A100/H100.
+    // - Since grid_dimensions is a power of two > 512, it is divisible by 32.
+    constexpr int BLOCK_X = 32;
+    constexpr int BLOCK_Y = 32;
 
-    // Compute the required shared memory size: each block requires a (blockDim.x+2) x (blockDim.y+2) tile.
-    const size_t shared_mem_size = (blockDim.x + 2) * (blockDim.y + 2) * sizeof(bool);
+    const int width = grid_dimensions;
 
-    // Launch the kernel.
-    // Note: Any necessary host-device synchronization is assumed to be handled by the caller.
-    game_of_life_kernel<<<gridDim, blockDim, shared_mem_size>>>(input, output, grid_dimensions);
+    // Grid dimensions exactly cover the domain with no partial blocks.
+    dim3 block(BLOCK_X, BLOCK_Y);
+    dim3 grid(width / BLOCK_X, width / BLOCK_Y);
+
+    // Launch kernel. No synchronization here; the caller handles it.
+    game_of_life_kernel<BLOCK_X, BLOCK_Y><<<grid, block>>>(input, output, width);
 }
-
-// The content below was not generated by GPT; it was added to ensure the framework can compile the code.
-
-
-#include <cstdint>
-void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
-    (void)input;
-    (void)output;
-    (void)grid_dimensions;
-}
-
-void initialize_internal_data_structures(int grid_dimensions) {
-    (void)grid_dimensions;
-}
-// this label is used to identify the memory layout of the input and output arrays by the framework
-// MEMORY_LAYOUT: BOOLS

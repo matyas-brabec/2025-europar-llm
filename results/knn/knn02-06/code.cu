@@ -1,237 +1,348 @@
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
-#include <cfloat>      // for FLT_MAX
-#include <utility>     // for std::pair
+#include <algorithm>
+#include <cstdint>
+#include <utility>
 
-// -----------------------------------------------------------------------------
-// In this implementation, each query is processed by one warp (32 threads).
-// Each warp maintains its own private candidate list of k nearest neighbors,
-// distributed evenly across its 32 lanes. In particular, each thread holds
-// k/32 candidates in its private array. For every new data point (loaded in
-// tiles into shared memory) the warp’s lanes cooperatively compute the squared
-// Euclidean distance to the query and update their candidate lists.
-// After processing all data tiles, each warp locally sorts its  (k/32)-element
-// lists (each lane sorts its private L candidates). Then, using a per-warp
-// shared buffer (allocated in dynamic shared memory), the 32 lanes write their
-// candidates in an interleaved fashion so that the combined buffer holds k
-// unsorted candidates. Next, lane 0 of the warp collects these k candidates,
-// performs an in-place bitonic sort (the input size k is always a power of two)
-// to order them by ascending distance, and writes the sorted candidates back to
-// the shared buffer. Finally, the warp’s threads cooperatively write the sorted
-// k-nearest candidates to global memory.
-// 
-// The kernel iterates over the data points using a tile (batch) size defined by
-// TILE_SIZE. The tile is loaded from global memory to shared memory once per
-// iteration to amortize memory latency.
-// ----------------------------------------------------------------------------- 
+// Device-side POD equivalent of std::pair<int, float> to avoid depending on libstdc++ device annotations.
+// We will reinterpret_cast the std::pair<int,float>* pointer to this type inside run_knn.
+struct PairIF {
+    int first;
+    float second;
+};
 
-// Define the tile size for caching data points in shared memory.
-#define TILE_SIZE 1024
-
-// CUDA kernel implementing k-NN for 2D points.
-// Each warp processes one query.
-__global__ void knn_kernel(const float2 *query, int query_count,
-                           const float2 *data, int data_count,
-                           std::pair<int, float> *result, int k)
-{
-    // Determine which warp (within the block and globally) we are in.
-    int warp_id = threadIdx.x / 32;      // warp index within block
-    int lane     = threadIdx.x & 31;       // lane index within warp
-    int warpsPerBlock = blockDim.x / 32;
-    int global_warp_id = blockIdx.x * warpsPerBlock + warp_id;
-    if (global_warp_id >= query_count)
-        return;  // if there is no query assigned to this warp, exit.
-
-    // Load the query point for this warp.
-    float2 q = query[global_warp_id];
-
-    // Each warp will maintain k nearest neighbor candidates.
-    // They are distributed evenly among the 32 threads in the warp.
-    // Let L = k/32: each thread stores L candidates.
-    int L = k / 32;
-
-    // Each thread maintains a private candidate list (local arrays) of size L.
-    // Each candidate is a pair: (data point index, squared distance).
-    // Initialize distances to FLT_MAX and indices to -1.
-    float local_dists[32];  // maximal L is 1024/32 = 32.
-    int   local_inds[32];
-#pragma unroll
-    for (int i = 0; i < L; i++) {
-        local_dists[i] = FLT_MAX;
-        local_inds[i]  = -1;
+// Utility: check for CUDA runtime errors in host code paths. This is used only in the host function below.
+static inline void cuda_check(cudaError_t e, const char* file, int line) {
+    if (e != cudaSuccess) {
+        fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e), file, line);
+        abort();
     }
+}
+#define CUDA_CHECK(call) cuda_check((call), __FILE__, __LINE__)
 
-    // -------------------------------------------------------------------------
-    // Shared memory allocation:
-    // The dynamic shared memory is partitioned as follows:
-    // 1. A tile for caching data points: TILE_SIZE elements of type float2.
-    // 2. A per-warp candidate merge buffer: each warp uses k elements of
-    //    type std::pair<int, float>. The number of warps per block is (blockDim.x/32).
-    // The total shared memory size (in bytes) should be set accordingly at kernel launch.
-    // -------------------------------------------------------------------------
-    extern __shared__ char shared_mem[];
-    // Shared memory region for data tile.
-    float2 *tile = reinterpret_cast<float2*>(shared_mem);
-    // Compute pointer to candidate merge buffer (placed after the tile).
-    std::pair<int, float> *warp_candidates =
-         reinterpret_cast<std::pair<int, float>*>(shared_mem + TILE_SIZE * sizeof(float2));
+// Warp-level constants
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
 
-    // Calculate the number of tiles needed to cover all data points.
-    int num_tiles = (data_count + TILE_SIZE - 1) / TILE_SIZE;
+// Max threads per block we plan to use. We adapt the actual warps per block at runtime,
+// but never launch more than MAX_WARPS_PER_BLOCK warps.
+#ifndef MAX_WARPS_PER_BLOCK
+#define MAX_WARPS_PER_BLOCK 8
+#endif
 
-    // Process data points in tiles.
-    for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        // Load a tile of data points from global memory into shared memory.
-        // Let only the first TILE_SIZE threads in the block (if blockDim.x > TILE_SIZE)
-        // do the loading.
-        int load_idx = tile_idx * TILE_SIZE + threadIdx.x;
-        if (threadIdx.x < TILE_SIZE) {
-            if (load_idx < data_count)
-                tile[threadIdx.x] = data[load_idx];
-            else {
-                // For out-of-bound indices, fill with dummy values.
-                tile[threadIdx.x].x = 0.f;
-                tile[threadIdx.x].y = 0.f;
-            }
-        }
-        __syncthreads(); // ensure the tile is loaded before use
+// Device utility: swap two elements in the heap arrays.
+__device__ __forceinline__ void heap_swap(float* __restrict__ hd, int* __restrict__ hi, int a, int b) {
+    float td = hd[a]; hd[a] = hd[b]; hd[b] = td;
+    int ti = hi[a]; hi[a] = hi[b]; hi[b] = ti;
+}
 
-        // Determine the number of valid data points in this tile.
-        int tile_points = TILE_SIZE;
-        if (tile_idx == num_tiles - 1)
-            tile_points = data_count - tile_idx * TILE_SIZE;
-
-        // Each warp processes the current tile. The lanes cooperate in a strided loop.
-        for (int i = lane; i < tile_points; i += 32) {
-            float2 d_pt = tile[i];
-            float dx = q.x - d_pt.x;
-            float dy = q.y - d_pt.y;
-            float dist = dx * dx + dy * dy;  // squared Euclidean distance
-            int data_index = tile_idx * TILE_SIZE + i;
-
-            // Update the thread’s private candidate list.
-            // Find the worst (largest) distance in the local candidate array.
-            float worst = local_dists[0];
-            int worst_pos = 0;
-#pragma unroll
-            for (int j = 1; j < L; j++) {
-                if (local_dists[j] > worst) {
-                    worst = local_dists[j];
-                    worst_pos = j;
-                }
-            }
-            // If the new candidate is better, update the candidate at the worst position.
-            if (dist < worst) {
-                local_dists[worst_pos] = dist;
-                local_inds[worst_pos]  = data_index;
-            }
-        }
-        // Synchronize within the warp (not strictly needed here, but good practice).
-        __syncwarp();
-        __syncthreads(); // synchronize all threads before reusing shared tile memory
-    } // end for each tile
-
-    // Each thread now has an unsorted list of L candidate distances/indices.
-    // Sort the local candidate list in ascending order using insertion sort.
-    for (int i = 1; i < L; i++) {
-        float key_val = local_dists[i];
-        int   key_ind = local_inds[i];
-        int j = i - 1;
-        while (j >= 0 && local_dists[j] > key_val) {
-            local_dists[j + 1] = local_dists[j];
-            local_inds[j + 1]  = local_inds[j];
-            j--;
-        }
-        local_dists[j + 1] = key_val;
-        local_inds[j + 1]  = key_ind;
-    }
-
-    // Write each thread's sorted local list to the warp candidate merge buffer.
-    // The candidates are interleaved: each thread writes its i-th candidate to location (i*32 + lane).
-    std::pair<int, float> *myWarpBuffer = warp_candidates + warp_id * k;
-#pragma unroll
-    for (int i = 0; i < L; i++) {
-        myWarpBuffer[i * 32 + lane] = std::pair<int, float>(local_inds[i], local_dists[i]);
-    }
-    __syncwarp();
-
-    // Now the per-warp buffer "myWarpBuffer" holds k candidate pairs (unsorted).
-    // We need to sort these k candidates (by ascending distance) to obtain the final k-NN list.
-    // For simplicity, we let lane 0 of the warp perform a serial bitonic sort on the k elements.
-    if (lane == 0) {
-        // Allocate a temporary array (on local memory) to hold the k candidates.
-        // Maximum k is 1024.
-        std::pair<int, float> sorted[1024];
-#pragma unroll
-        for (int i = 0; i < k; i++) {
-            sorted[i] = myWarpBuffer[i];
-        }
-        // Bitonic sort: k is guaranteed to be a power-of-two.
-        for (int size = 2; size <= k; size <<= 1) {
-            for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                for (int i = 0; i < k; i++) {
-                    int j = i ^ stride;
-                    if (j > i) {
-                        // Determine sorting direction.
-                        bool ascending = ((i & size) == 0);
-                        if (ascending) {
-                            if (sorted[i].second > sorted[j].second) {
-                                std::pair<int, float> tmp = sorted[i];
-                                sorted[i] = sorted[j];
-                                sorted[j] = tmp;
-                            }
-                        } else {
-                            if (sorted[i].second < sorted[j].second) {
-                                std::pair<int, float> tmp = sorted[i];
-                                sorted[i] = sorted[j];
-                                sorted[j] = tmp;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Write back the sorted array to the warp candidate buffer.
-        for (int i = 0; i < k; i++) {
-            myWarpBuffer[i] = sorted[i];
-        }
-    }
-    __syncwarp(); // ensure all lanes see the sorted candidates
-
-    // Finally, write the k sorted results for this query to global memory.
-    // Each warp writes to result[global_warp_id * k ... global_warp_id * k + k - 1].
-    int base_index = global_warp_id * k;
-    for (int i = lane; i < k; i += 32) {
-        result[base_index + i] = myWarpBuffer[i];
+// Device utility: sift-up operation for a max-heap.
+// Moves the element at position 'pos' up until the max-heap property is restored.
+__device__ __forceinline__ void heap_sift_up(float* __restrict__ hd, int* __restrict__ hi, int pos) {
+    while (pos > 0) {
+        int parent = (pos - 1) >> 1;
+        if (hd[parent] >= hd[pos]) break;
+        heap_swap(hd, hi, parent, pos);
+        pos = parent;
     }
 }
 
-// -----------------------------------------------------------------------------
-// Host interface function that launches the CUDA kernel.
-// The caller is responsible for allocating 'query', 'data', and 'result' on device.
-// k is a power of 2 between 32 and 1024 inclusive.
-// -----------------------------------------------------------------------------
-void run_knn(const float2 *query, int query_count,
-             const float2 *data, int data_count,
-             std::pair<int, float> *result, int k)
+// Device utility: sift-down operation for a max-heap of size 'heap_size'.
+// Restores the max-heap property starting from the root at position 0.
+__device__ __forceinline__ void heap_sift_down(float* __restrict__ hd, int* __restrict__ hi, int heap_size) {
+    int pos = 0;
+    while (true) {
+        int left = (pos << 1) + 1;
+        if (left >= heap_size) break;
+        int right = left + 1;
+        int largest = left;
+        if (right < heap_size && hd[right] > hd[left]) {
+            largest = right;
+        }
+        if (hd[pos] >= hd[largest]) break;
+        heap_swap(hd, hi, pos, largest);
+        pos = largest;
+    }
+}
+
+// Device utility: push a new element (d, id) into the max-heap if heap_size < k.
+// Post-condition: heap_size is incremented and heap property maintained.
+__device__ __forceinline__ void heap_push(float* __restrict__ hd, int* __restrict__ hi, int& heap_size, float d, int id) {
+    int pos = heap_size;
+    hd[pos] = d;
+    hi[pos] = id;
+    heap_size++;
+    heap_sift_up(hd, hi, pos);
+}
+
+// Device utility: replace root with (d, id) and sift-down to maintain heap property.
+__device__ __forceinline__ void heap_replace_root(float* __restrict__ hd, int* __restrict__ hi, int heap_size, float d, int id) {
+    hd[0] = d;
+    hi[0] = id;
+    heap_sift_down(hd, hi, heap_size);
+}
+
+// Device utility: pop the root from the heap (max element) and write it to (out_d, out_i).
+// Decreases heap_size and maintains heap property.
+__device__ __forceinline__ void heap_pop(float* __restrict__ hd, int* __restrict__ hi, int& heap_size, float& out_d, int& out_i) {
+    out_d = hd[0];
+    out_i = hi[0];
+    int last = heap_size - 1;
+    hd[0] = hd[last];
+    hi[0] = hi[last];
+    heap_size = last;
+    if (heap_size > 0) {
+        heap_sift_down(hd, hi, heap_size);
+    }
+}
+
+// Each query is processed by a single warp (32 threads). Data points are processed in tiles cached in shared memory.
+// Per-warp, we maintain a private max-heap of size k in shared memory (distances + indices).
+// This kernel is designed for large data_count and many queries, with k in [32, 1024] (power of two).
+__global__ void knn_kernel(
+    const float2* __restrict__ query, int query_count,
+    const float2* __restrict__ data, int data_count,
+    PairIF* __restrict__ result, int k,
+    int warps_per_block, int tile_points)
 {
-    // Choose threads-per-block. Each warp (32 threads) processes one query.
-    // We choose 128 threads per block (i.e. 4 warps per block).
-    const int threadsPerBlock = 128;
-    int warpsPerBlock = threadsPerBlock / 32;
-    // Total number of warps (queries) to process.
-    int totalWarps = query_count;
-    int numBlocks = (totalWarps + warpsPerBlock - 1) / warpsPerBlock;
+    extern __shared__ unsigned char smem[];
+    // Shared memory layout:
+    // [tile_points * sizeof(float2)] + [warps_per_block * k * sizeof(float)] + [warps_per_block * k * sizeof(int)] + [warps_per_block * sizeof(int)]
+    float2* tile = reinterpret_cast<float2*>(smem);
+    size_t tile_bytes = size_t(tile_points) * sizeof(float2);
+    unsigned char* ptr = smem + tile_bytes;
 
-    // Calculate shared memory size (in bytes):
-    // 1. For data tile: TILE_SIZE * sizeof(float2)
-    // 2. For candidate merge buffers: (warpsPerBlock * k) * sizeof(std::pair<int, float>)
-    size_t shmemSize = TILE_SIZE * sizeof(float2) +
-                       warpsPerBlock * k * sizeof(std::pair<int, float>);
+    float* all_heap_d = reinterpret_cast<float*>(ptr);
+    ptr += size_t(warps_per_block) * size_t(k) * sizeof(float);
 
-    // Launch the kernel.
-    knn_kernel<<<numBlocks, threadsPerBlock, shmemSize>>>(query, query_count,
-                                                          data, data_count,
-                                                          result, k);
-    // Optionally, one might add error checking of the kernel launch here.
+    int* all_heap_i = reinterpret_cast<int*>(ptr);
+    ptr += size_t(warps_per_block) * size_t(k) * sizeof(int);
+
+    int* heap_sizes = reinterpret_cast<int*>(ptr);
+    // ptr += size_t(warps_per_block) * sizeof(int); // Not needed further
+
+    int tid = threadIdx.x;
+    int lane = tid & (WARP_SIZE - 1);
+    int warp_in_block = tid >> 5;
+    int global_warp = blockIdx.x * warps_per_block + warp_in_block;
+
+    bool warp_active = (global_warp < query_count);
+
+    // Per-warp heap pointers into shared memory
+    float* heap_d = all_heap_d + size_t(warp_in_block) * size_t(k);
+    int*   heap_i = all_heap_i + size_t(warp_in_block) * size_t(k);
+
+    // Initialize heap size to 0 for active warps
+    if (lane == 0) {
+        heap_sizes[warp_in_block] = 0;
+    }
+    __syncwarp();
+
+    // Broadcast query point to all lanes in this warp
+    float qx = 0.0f, qy = 0.0f;
+    if (warp_active) {
+        if (lane == 0) {
+            float2 q = query[global_warp];
+            qx = q.x;
+            qy = q.y;
+        }
+        // Broadcast qx, qy from lane 0 to all lanes of the warp
+        unsigned mask = 0xffffffffu;
+        qx = __shfl_sync(mask, qx, 0);
+        qy = __shfl_sync(mask, qy, 0);
+    }
+
+    // Process data in tiles cached in shared memory
+    for (int tile_start = 0; tile_start < data_count; tile_start += tile_points) {
+        int count = data_count - tile_start;
+        if (count > tile_points) count = tile_points;
+
+        // Block-level cooperative load of the tile into shared memory.
+        // Use a contiguous, coalesced access pattern.
+        for (int i = threadIdx.x; i < count; i += blockDim.x) {
+            tile[i] = data[tile_start + i];
+        }
+        __syncthreads();
+
+        // Each active warp processes the tile; inactive warps just participate in barriers.
+        if (warp_active) {
+            // Stride over tile indices by warp size so each lane handles a separate subset.
+            for (int t = lane; t < count; t += WARP_SIZE) {
+                // Load point from shared memory
+                float2 p = tile[t];
+                float dx = qx - p.x;
+                float dy = qy - p.y;
+                // Squared Euclidean distance (use FMA for throughput)
+                float d = fmaf(dx, dx, dy * dy);
+                int id = tile_start + t;
+
+                // We will perform at most one insertion per lane per processed element.
+                // Identify candidates that might need an insertion into the heap.
+                // We snapshot heap size to avoid reading invalid heap root when heap is not full yet.
+                int local_hs = heap_sizes[warp_in_block];
+                bool want_insert = (local_hs < k);
+                if (!want_insert) {
+                    // Now it's safe to read heap root (heap_d[0]) because heap_size >= 1
+                    float worst = heap_d[0];
+                    want_insert = (d < worst);
+                }
+
+                // Ballot lanes that want to insert; then handle them one-by-one in lane order.
+                unsigned active = __ballot_sync(0xffffffffu, want_insert);
+                while (active) {
+                    int leader = __ffs(active) - 1; // index [0..31] of first set bit
+                    if (lane == leader) {
+                        // Re-check against up-to-date heap state
+                        int& hs = heap_sizes[warp_in_block];
+                        if (hs < k) {
+                            // Heap not full yet: push the candidate
+                            heap_push(heap_d, heap_i, hs, d, id);
+                        } else {
+                            // Heap full: replace root if this candidate is better (smaller distance)
+                            if (d < heap_d[0]) {
+                                heap_replace_root(heap_d, heap_i, hs, d, id);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                    // Clear processed bit and continue
+                    active &= active - 1;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // After processing all tiles, lane 0 of each active warp extracts the k nearest neighbors
+    // from the max-heap into the result array in ascending order of distance.
+    if (warp_active && lane == 0) {
+        int hs = heap_sizes[warp_in_block];
+        // It is possible (only theoretically) that data_count < k; the problem statement guarantees data_count >= k.
+        // But to be robust, clamp hs to k.
+        if (hs > k) hs = k;
+
+        // Extract from heap: popping gives elements in non-increasing order (largest first).
+        // We store them into result in reverse so that result[j] is j-th nearest neighbor (ascending distances).
+        PairIF* out = result + size_t(global_warp) * size_t(k);
+        for (int pos = hs - 1; pos >= 0; --pos) {
+            float d;
+            int id;
+            heap_pop(heap_d, heap_i, hs, d, id);
+            out[pos].first = id;
+            out[pos].second = d;
+        }
+        // If for any reason hs < k (should not happen as data_count >= k), pad the remaining
+        // entries with invalid indices and +INF distances to maintain invariants.
+        for (int pos = 0; pos < k - hs; ++pos) {
+            out[pos].first = -1;
+            out[pos].second = CUDART_INF_F;
+        }
+    }
+}
+
+// Host helper: compute an efficient launch configuration based on available shared memory.
+// We adapt warps per block and tile size to fit within the device's max dynamic shared memory limit.
+// - warps_per_block in {8, 4, 2, 1}
+// - tile_points chosen to use the remaining shared memory after accounting for per-warp top-k storage
+static inline void choose_launch_config(int k, int query_count, int data_count,
+                                        int& warps_per_block, dim3& blocks, dim3& threads,
+                                        int& tile_points, size_t& smem_bytes) {
+    // Query device properties
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    // Maximum dynamic shared memory per block available (opt-in for Ampere/Hopper)
+    int max_smem_optin = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    int max_smem_default = prop.sharedMemPerBlock; // typically 48/64/96 KB
+    int max_smem = (max_smem_optin > 0 ? max_smem_optin : max_smem_default);
+
+    // Start with a preferred number of warps per block and reduce if necessary to fit smem.
+    int candidate_warps[] = { MAX_WARPS_PER_BLOCK, 4, 2, 1 };
+    warps_per_block = 1;
+    tile_points = 0;
+    smem_bytes = 0;
+
+    for (int w : candidate_warps) {
+        if (w <= 0) continue;
+        // Per-warp top-k storage: distances (float) + indices (int) + heap_size (int per warp)
+        size_t bytes_topk = size_t(w) * size_t(k) * (sizeof(float) + sizeof(int)) + size_t(w) * sizeof(int);
+        // We need at least one blockDim.x worth of points in the tile to get a perfectly coalesced load.
+        int block_threads = w * WARP_SIZE;
+        size_t bytes_min_tile = size_t(block_threads) * sizeof(float2); // at least one per thread
+        if (bytes_topk + bytes_min_tile > size_t(max_smem)) {
+            // Not enough shared memory for this number of warps per block; try fewer warps.
+            continue;
+        }
+        // Use as many points as remaining shared memory allows.
+        size_t bytes_tile = size_t(max_smem) - bytes_topk;
+        int tp = int(bytes_tile / sizeof(float2));
+        // Round tile_points down to a multiple of block_threads for coalesced loads
+        tp = (tp / block_threads) * block_threads;
+        // Ensure at least one stride
+        if (tp < block_threads) tp = block_threads;
+        // Upper bound tile_points by data_count to avoid overprovisioning dynamic shared memory (not necessary, but reasonable)
+        if (tp > data_count) tp = ((data_count + block_threads - 1) / block_threads) * block_threads;
+        // Compute shared memory bytes for this configuration
+        size_t smem_needed = bytes_topk + size_t(tp) * sizeof(float2);
+        if (smem_needed <= size_t(max_smem)) {
+            warps_per_block = w;
+            tile_points = tp;
+            smem_bytes = smem_needed;
+            break;
+        }
+    }
+
+    // Fallback safety: if the above loop fails (should not), pick 1 warp/block with minimal tile.
+    if (tile_points <= 0 || smem_bytes == 0) {
+        warps_per_block = 1;
+        int block_threads = warps_per_block * WARP_SIZE;
+        size_t bytes_topk = size_t(warps_per_block) * size_t(k) * (sizeof(float) + sizeof(int)) + size_t(warps_per_block) * sizeof(int);
+        size_t bytes_tile = size_t(max_smem) - bytes_topk;
+        int tp = int(bytes_tile / sizeof(float2));
+        tp = (tp / block_threads) * block_threads;
+        if (tp < block_threads) tp = block_threads;
+        tile_points = tp;
+        smem_bytes = bytes_topk + size_t(tp) * sizeof(float2);
+    }
+
+    // Compute launch grid/block dimensions
+    threads = dim3(warps_per_block * WARP_SIZE);
+    int blocks_needed = (query_count + warps_per_block - 1) / warps_per_block;
+    blocks = dim3(blocks_needed, 1, 1);
+}
+
+// Entry point: launch the optimized CUDA kernel.
+// - query: pointer to device memory array of float2, size query_count
+// - data: pointer to device memory array of float2, size data_count
+// - result: pointer to device memory array of std::pair<int,float>, size query_count * k
+// - k: number of neighbors (power of two between 32 and 1024), with data_count >= k
+void run_knn(const float2* query, int query_count, const float2* data, int data_count, std::pair<int, float>* result, int k) {
+    if (query_count <= 0 || data_count <= 0 || k <= 0) return;
+
+    // Choose launch configuration based on device shared memory capacity and inputs
+    int warps_per_block = 0;
+    int tile_points = 0;
+    size_t smem_bytes = 0;
+    dim3 blocks, threads;
+    choose_launch_config(k, query_count, data_count, warps_per_block, blocks, threads, tile_points, smem_bytes);
+
+    // Opt-in to use the maximum dynamic shared memory available on the device for this kernel
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    int max_smem_optin = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    if (max_smem_optin > 0) {
+        CUDA_CHECK(cudaFuncSetAttribute(knn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem_optin));
+    }
+
+    // Launch kernel. We pass result as POD PairIF* to be writable by device code.
+    knn_kernel<<<blocks, threads, smem_bytes>>>(
+        query, query_count, data, data_count,
+        reinterpret_cast<PairIF*>(result), k,
+        warps_per_block, tile_points
+    );
+    CUDA_CHECK(cudaGetLastError());
 }

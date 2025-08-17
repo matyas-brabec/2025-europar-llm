@@ -1,11 +1,11 @@
 {
   "prompt_uncached_tokens": 766,
-  "prompt_uncached_cost": 0.0008426,
+  "prompt_uncached_cost": 0.0009575000000000001,
   "prompt_cached_tokens": 0,
   "prompt_cached_cost": 0.0,
-  "output_tokens": 2167,
-  "cost_output": 0.009534800000000001,
-  "reasoning_tokens": 29504,
-  "cost_reasoning": 0.1298176,
-  "total_cost": 0.14019500000000001
+  "output_tokens": 2484,
+  "cost_output": 0.02484,
+  "reasoning_tokens": 12992,
+  "cost_reasoning": 0.12992,
+  "total_cost": 0.1557175
 }

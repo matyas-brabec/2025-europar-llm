@@ -1,350 +1,423 @@
-// This complete CUDA source implements a k‐nearest neighbors (k‐NN)
-// algorithm for 2D points using a single warp per query. The overall design
-// is as follows:
-//
-// • Each warp (32 threads) is assigned one query point.
-// • The current “intermediate” k‐nearest neighbor result is maintained in registers,
-//   distributed in “row–major” order: each thread holds k/32 consecutive candidate (index,distance)
-//   pairs that together form a sorted (ascending by distance) array of length k.
-// • A per–warp candidate buffer is allocated in shared memory (of size k candidates).
-//   As the warp examines batches of data points (uploaded cooperatively into shared memory),
-//   each thread computes the squared Euclidean distance from its query point and, if the
-//   distance is lower than the current max distance (i.e. the k-th neighbor’s distance),
-//   the candidate is appended into the shared buffer.
-// • When the candidate buffer becomes full (or after processing the last batch),
-//   the candidate buffer is merged with the intermediate result by (a) “swapping” the
-//   registers and shared memory arrays, (b) sorting the candidate buffer (now in registers)
-//   using a warp–level Bitonic Sort, (c) merging the two sorted arrays into a new sorted
-//   distributed array of k candidates, and (d) finally sorting the merged result with
-//   Bitonic Sort.  (The “merge” is implemented using a simple linear–scan merge for clarity.)
-// • Finally, the warp writes its k sorted nearest neighbors to the global result array.
-//
-// The distributed Bitonic sort works on an array of “k” elements that is distributed
-// in row–major order among the 32 threads of a warp, so that each thread holds k/32 consecutive
-// elements. In the Bitonic sort kernels, exchanges between registers are performed via warp–shuffle
-// instructions and are restricted to elements with the same intra–thread (local) index.
-//
-// NOTE: This implementation is optimized for modern NVIDIA GPUs (e.g. A100/H100)
-// and uses cooperative warp–level programming. The kernel launch configuration must supply
-// enough dynamic shared memory as explained below.
-//
-// Compile with the latest CUDA toolkit and a C++14–compatible host compiler.
-
 #include <cuda_runtime.h>
-#include <cfloat>
-#include <utility>
+#include <stdint.h>
 
-// ----------------------------------------------------------------------
-// Data structure for a candidate (neighbor index and squared distance)
-struct Candidate {
-    int idx;
-    float dist;
+// This implementation assigns one warp (32 threads) to each query.
+// Each thread keeps k/32 consecutive nearest neighbors in registers.
+// Candidate buffers of size k per warp are stored in shared memory.
+// Batches of data points are loaded into shared memory and processed by all warps in the block.
+// When the candidate buffer is full (or after the final batch), we merge it into the intermediate
+// result using the described bitonic sort and bitonic merge technique.
+//
+// Notes:
+// - k is a power of two in [32, 1024]; therefore k/32 (KK) is a power of two in [1, 32].
+// - The code uses warp-synchronous programming with __shfl_sync and __ballot_sync.
+// - The intermediate result (top-k) is kept sorted ascending at all times (after merges).
+
+// Tunable parameters and constants
+#ifndef KNN_WARP_SIZE
+#define KNN_WARP_SIZE 32
+#endif
+
+#ifndef KNN_THREADS_PER_BLOCK
+#define KNN_THREADS_PER_BLOCK 256  // 8 warps per block
+#endif
+
+#ifndef KNN_TILE_POINTS
+#define KNN_TILE_POINTS 4096       // Number of data points per shared-memory tile (~32KB)
+#endif
+
+#ifndef KNN_MAX_K
+#define KNN_MAX_K 1024             // Maximum k we support
+#endif
+
+#define FULL_MASK 0xFFFFFFFFu
+
+struct PairOut {
+    int first;
+    float second;
 };
 
-// ----------------------------------------------------------------------
-// Swap two Candidate objects.
-__device__ inline void swap_candidate(Candidate &a, Candidate &b) {
-    Candidate tmp = a;
-    a = b;
-    b = tmp;
+// Compute squared Euclidean distance between two float2 points
+__device__ __forceinline__ float distance2(const float2 &a, const float2 &b) {
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    // Use FMA to improve performance and precision
+    return fmaf(dx, dx, dy * dy);
 }
 
-// ----------------------------------------------------------------------
-// A simple insertion sort to sort a small array of Candidates (ascending by distance).
-// This is used to sort each thread's local candidate array.
-__device__ inline void local_insertion_sort(Candidate arr[], int n) {
-    for (int i = 1; i < n; i++) {
-        Candidate key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j].dist > key.dist) {
-            arr[j + 1] = arr[j];
-            j--;
-        }
-        arr[j + 1] = key;
-    }
-}
+// Warp-wide bitonic sort for k elements distributed across threads.
+// Each thread holds KK = k / 32 consecutive elements in registers, stored in arrays dist[] and idx[].
+// The sort order is ascending by distance.
+__device__ __forceinline__ void warp_bitonic_sort(float dist[], int idx[], int k, int KK, int lane) {
+    // m = log2(KK). Since KK is a power of two, we can use __ffs(KK)-1 (ffs returns 1-based index).
+    const int m = __ffs(KK) - 1;
 
-// ----------------------------------------------------------------------
-// Given a distributed candidate array stored in registers in row–major order,
-// this helper returns the Candidate at global index "global_idx".
-// Each thread holds an array of "local_n" elements; the global array length is (32 * local_n = k).
-// We assume all threads in the warp execute this function synchronously.
-__device__ inline Candidate getDistributedCandidate(const Candidate reg[], int local_n, int global_idx) {
-    int lane = threadIdx.x & 31; // lane within warp
-    int owner = global_idx / local_n;
-    int pos = global_idx % local_n;
-    Candidate val;
-    // Use warp shuffle to broadcast the element at index "pos" from thread "owner"
-    val.idx  = __shfl_sync(0xFFFFFFFF, reg[pos].idx, owner);
-    val.dist = __shfl_sync(0xFFFFFFFF, reg[pos].dist, owner);
-    return val;
-}
+    // Outer loop over bitonic sequence length
+    for (int size = 2; size <= k; size <<= 1) {
+        // Inner loop over half-clean distance "stride"
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            // Inter-thread or intra-thread phase depends on whether stride toggles a bit in the KK part (low m bits)
+            if (stride < KK) {
+                // Intra-thread compare-exchange: partner is within the same thread registers at index t^stride
+                for (int t = 0; t < KK; t++) {
+                    // Restrict updates to one side of each pair to avoid double-updates within the thread
+                    if ((t & stride) == 0) {
+                        int t2 = t ^ stride;
 
-// ----------------------------------------------------------------------
-// This function performs a Bitonic Sort on a distributed array of "n" elements,
-// where n = 32 * local_n, stored in row–major order among the warp threads.
-// Each thread holds a local array "reg" of "local_n" Candidates. The algorithm
-// first sorts the local arrays, then performs a global bitonic sort with pair–wise
-// exchanges using warp shuffle instructions. (Exchanges are done only on elements
-// with the same local index.)
-__device__ inline void warp_sort_distributed(Candidate reg[], int n, int local_n) {
-    // First, each thread sorts its own local array.
-    local_insertion_sort(reg, local_n);
-    // Now n = 32 * local_n.
-    // The Bitonic sort algorithm (pseudocode provided) is applied in a distributed manner.
-    // Each thread iterates over its local elements and participates in exchanges when
-    // its global index (computed as: (lane * local_n + local_index)) satisfies the condition.
-    for (int k = 2; k <= n; k *= 2) {
-        for (int j = k / 2; j > 0; j /= 2) {
-            for (int i_local = 0; i_local < local_n; i_local++) {
-                int global_idx = (threadIdx.x & 31) * local_n + i_local;
-                int partner = global_idx ^ j;  // partner index
-                if (partner > global_idx) {
-                    // Only perform exchange if the two elements reside in the same register slot,
-                    // i.e. if (partner % local_n) equals our local index.
-                    if ((partner % local_n) == i_local) {
-                        Candidate myVal = reg[i_local];
-                        int partner_lane = partner / local_n;
-                        Candidate otherVal;
-                        otherVal.idx  = __shfl_sync(0xFFFFFFFF, reg[i_local].idx, partner_lane);
-                        otherVal.dist = __shfl_sync(0xFFFFFFFF, reg[i_local].dist, partner_lane);
-                        bool swapFlag = false;
-                        // Determine sort direction: if (global_idx & k)==0, ascending sort; else descending.
-                        if ((global_idx & k) == 0) {
-                            if (myVal.dist > otherVal.dist)
-                                swapFlag = true;
+                        int i = lane * KK + t;
+                        bool up = ((i & size) == 0);
+
+                        float a_d = dist[t];
+                        int   a_i = idx[t];
+
+                        float b_d = dist[t2];
+                        int   b_i = idx[t2];
+
+                        // Compare
+                        bool swap = (a_d > b_d);
+                        // If descending, reverse comparison
+                        if (!up) swap = !swap;
+
+                        // Perform compare-exchange
+                        float lo_d = swap ? b_d : a_d;
+                        int   lo_i = swap ? b_i : a_i;
+                        float hi_d = swap ? a_d : b_d;
+                        int   hi_i = swap ? a_i : b_i;
+
+                        if (up) {
+                            dist[t]  = lo_d; idx[t]  = lo_i;
+                            dist[t2] = hi_d; idx[t2] = hi_i;
                         } else {
-                            if (myVal.dist < otherVal.dist)
-                                swapFlag = true;
-                        }
-                        if (swapFlag) {
-                            // In a compare–exchange step of Bitonic Sort,
-                            // the new value for this position is the minimum (for ascending order)
-                            // or maximum (for descending order) of the two.
-                            Candidate newVal;
-                            if ((global_idx & k) == 0)
-                                newVal = (myVal.dist < otherVal.dist) ? myVal : otherVal;
-                            else
-                                newVal = (myVal.dist > otherVal.dist) ? myVal : otherVal;
-                            reg[i_local] = newVal;
+                            dist[t]  = hi_d; idx[t]  = hi_i;
+                            dist[t2] = lo_d; idx[t2] = lo_i;
                         }
                     }
                 }
-            }
-            // Synchronize lanes in the warp.
-            __syncwarp();
-        }
-    }
-}
-
-// ----------------------------------------------------------------------
-// A simple wrapper for Bitonic sort on a local array in a single thread.
-// (Not needed for global sort; provided for clarity.)
-__device__ inline void warp_bitonic_sort(Candidate arr[], int local_n) {
-    local_insertion_sort(arr, local_n);
-}
-
-// ----------------------------------------------------------------------
-// This function merges two sorted distributed arrays (each of length k, where k = 32*local_n)
-// into a new sorted distributed array (keeps only the k smallest elements).
-// The two sorted arrays are:
-//    - "intermediate": the current warp’s intermediate result (in registers)
-//    - A second array from a candidate buffer that has been collected in shared memory.
-// For clarity (and simplicity), we implement the merge via a linear scan that, for each
-// global output index, selects the appropriate candidate from the union.
-// The merge is performed cooperatively by the warp using warp–shuffle operations.
-__device__ inline void warp_merge_shared(
-    Candidate intermediate[],         // distributed array in registers (length = k, sorted)
-    Candidate *warpBuffer,            // pointer to the warp's candidate buffer in shared memory
-    int candidate_count,              // number of candidates in the warp buffer (may be < k)
-    int k,                            // full capacity (k must be a multiple of 32)
-    int local_n                       // k/32 (number of elements per thread)
-) {
-    int lane = threadIdx.x & 31;
-    // Each thread copies its share from the candidate buffer (row–major order).
-    Candidate buffer_reg[32];  // local copy (max local_n assumed <= 32)
-    for (int i = 0; i < local_n; i++) {
-        int global_idx = lane * local_n + i;
-        if (global_idx < candidate_count) {
-            buffer_reg[i] = warpBuffer[global_idx];
-        } else {
-            buffer_reg[i].dist = FLT_MAX;
-            buffer_reg[i].idx  = -1;
-        }
-    }
-    // Sort the candidate buffer copy (distributed array) using warp sort.
-    warp_sort_distributed(buffer_reg, k, local_n);
-    // Merge the two sorted distributed arrays into a new intermediate result.
-    // Each thread will compute its local output (i.e. the elements corresponding to
-    // global indices: (lane * local_n) through (lane * local_n + local_n - 1)).
-    Candidate merged[32];
-    for (int i = 0; i < local_n; i++) {
-        int global_idx = lane * local_n + i;
-        int count = 0;
-        int ptrA = 0, ptrB = 0;
-        Candidate cand;
-        // Perform a simple linear merge (scan) until "global_idx+1" elements have been chosen.
-        while (count <= global_idx) {
-            Candidate a = (ptrA < k) ? getDistributedCandidate(buffer_reg, local_n, ptrA)
-                                     : Candidate{-1, FLT_MAX};
-            Candidate b = (ptrB < k) ? getDistributedCandidate(intermediate, local_n, ptrB)
-                                     : Candidate{-1, FLT_MAX};
-            if (a.dist <= b.dist) {
-                cand = a;
-                ptrA++;
+                // No inter-thread data dependency; __syncwarp() not strictly required here
             } else {
-                cand = b;
-                ptrB++;
+                // Inter-thread compare-exchange: partner lane differs; register index t stays the same.
+                int partner_delta = stride >> m; // lane xor mask
+                unsigned mask = FULL_MASK;
+
+                for (int t = 0; t < KK; t++) {
+                    int i = lane * KK + t;
+                    bool up = ((i & size) == 0);
+
+                    float a_d = dist[t];
+                    int   a_i = idx[t];
+
+                    float b_d = __shfl_xor_sync(mask, a_d, partner_delta);
+                    int   b_i = __shfl_xor_sync(mask, a_i, partner_delta);
+
+                    bool swap = (a_d > b_d);
+                    if (!up) swap = !swap;
+
+                    float lo_d = swap ? b_d : a_d;
+                    int   lo_i = swap ? b_i : a_i;
+                    float hi_d = swap ? a_d : b_d;
+                    int   hi_i = swap ? a_i : b_i;
+
+                    if (up) {
+                        dist[t] = lo_d; idx[t] = lo_i;
+                    } else {
+                        dist[t] = hi_d; idx[t] = hi_i;
+                    }
+                }
+                __syncwarp(); // Ensure warp-synchronous progress across inter-thread exchanges
             }
-            count++;
         }
-        merged[i] = cand;
     }
-    // Write the merged values back into the intermediate distributed array.
-    for (int i = 0; i < local_n; i++) {
-        intermediate[i] = merged[i];
-    }
-    // Final sort of the new intermediate array.
-    warp_sort_distributed(intermediate, k, local_n);
 }
 
-// ----------------------------------------------------------------------
-// The main k-NN kernel. Each warp (32 threads) processes one query and computes
-// its k nearest neighbors from a (large) data set. Data points are processed in batches,
-// with each batch loaded cooperatively into shared memory.
-__global__ void knn_kernel(
-    const float2 *query, int query_count,
-    const float2 *data, int data_count,
-    std::pair<int, float> *result,
-    int k  // k is a power of two between 32 and 1024 (inclusive)
-) {
-    // Each warp (32 threads) is assigned one query.
-    int warp_id_in_block = threadIdx.x / 32;
-    int lane = threadIdx.x & 31;
-    int warps_per_block = blockDim.x / 32;
-    int global_warp_id = blockIdx.x * warps_per_block + warp_id_in_block;
-    if (global_warp_id >= query_count)
-        return;
+// Merge the candidate buffer (shared memory) with the intermediate result (registers) as described:
+// 0) The intermediate result in registers is sorted ascending (invariant).
+// 1) Swap content so that the buffer is in registers.
+// 2) Sort the buffer (now in registers) ascending using bitonic sort.
+// 3) Merge buffer and intermediate result into registers by taking min of pairs (i, k - i - 1).
+// 4) Sort the merged result ascending using bitonic sort.
+// After this function, the registers contain the updated intermediate result, sorted ascending,
+// and maxDist is updated to the last (k-th) element.
+__device__ __forceinline__ void warp_merge_buffer_with_result(
+    float bestDist[], int bestIdx[],           // registers: current intermediate top-k
+    float tmpDist[], int tmpIdx[],             // registers: temporary storage for buffer during swap/sort
+    volatile float *bufDist, volatile int *bufIdx, // shared memory: candidate buffer (size k) per warp
+    volatile int *bufCountPtr,                 // shared: candidate count
+    int k, int KK, int lane, float &maxDist)
+{
+    int cc = *bufCountPtr;
 
-    // Load the query point for this warp.
-    float2 q = query[global_warp_id];
-
-    // Each thread holds k/32 candidate entries in registers.
-    int local_n = k / 32;
-    Candidate knn[32];  // local storage; maximum local_n is assumed <= 32.
-    // Initialize intermediate result with "infinite" distances.
-    for (int i = 0; i < local_n; i++) {
-        knn[i].dist = FLT_MAX;
-        knn[i].idx  = -1;
-    }
-    // At all times the distributed array (of total length k) stored in registers
-    // is kept sorted in ascending order.
-
-    //--------------------------------------------------------------------
-    // Shared memory layout (dynamically allocated):
-    // [0, warps_per_block * k * sizeof(Candidate)): per–warp candidate buffers.
-    // [warps_per_block * k * sizeof(Candidate), warps_per_block * k * sizeof(Candidate) + warps_per_block * sizeof(int)):
-    //    per–warp candidate counts.
-    // After that, a data tile buffer of TILE_SIZE elements (float2) is allocated.
-    extern __shared__ char shared_mem[];
-    int buffer_area = warps_per_block * k;
-    Candidate *warpBuffer_all = (Candidate*)shared_mem;
-    int *warpCandidateCount = (int*)(shared_mem + buffer_area * sizeof(Candidate));
-    // Define tile size (number of data points processed per batch).
-    const int TILE_SIZE = 256;
-    float2 *dataTile = (float2*)(shared_mem + buffer_area * sizeof(Candidate) + warps_per_block * sizeof(int));
-
-    // Initialize candidate count for this warp (only one thread in warp does it).
-    if (lane == 0) {
-        warpCandidateCount[warp_id_in_block] = 0;
+    // Pad the buffer with +inf if it's partially filled
+    if (cc < k) {
+        for (int p = lane; p < (k - cc); p += KNN_WARP_SIZE) {
+            int pos = cc + p;
+            bufDist[pos] = CUDART_INF_F;
+            bufIdx[pos]  = -1;
+        }
     }
     __syncwarp();
 
-    // Process the data in batches.
-    for (int batch_start = 0; batch_start < data_count; batch_start += TILE_SIZE) {
-        int batch_size = (batch_start + TILE_SIZE <= data_count) ? TILE_SIZE : (data_count - batch_start);
-        // Load the current batch (tile) of data points into shared memory.
-        for (int i = threadIdx.x; i < batch_size; i += blockDim.x) {
-            dataTile[i] = data[batch_start + i];
-        }
-        __syncthreads();  // ensure whole block has loaded the tile
+    // Step 1: Swap content of buffer and intermediate result so that buffer goes to registers.
+    // Load buffer into tmpDist/tmpIdx (registers), and write bestDist/bestIdx into shared buffer.
+    for (int t = 0; t < KK; t++) {
+        int i = lane * KK + t;
+        float bd = bufDist[i];
+        int   bi = bufIdx[i];
+        tmpDist[t] = bd;
+        tmpIdx[t]  = bi;
 
-        // Each warp processes the tile cooperatively.
-        // Each thread in the warp examines a subset of the tile with stride 32.
-        for (int i = lane; i < batch_size; i += 32) {
-            float2 d_point = dataTile[i];
-            float dx = d_point.x - q.x;
-            float dy = d_point.y - q.y;
-            float dist = dx * dx + dy * dy;
-            // Determine the current maximum distance from the intermediate result.
-            // The maximum is the last element of the sorted distributed array.
-            float current_max;
-            if (lane == 31) {
-                current_max = knn[local_n - 1].dist;
-            }
-            current_max = __shfl_sync(0xFFFFFFFF, current_max, 31);
-            if (dist < current_max) {
-                // Prepare candidate.
-                Candidate cand;
-                cand.idx  = batch_start + i;  // Global index of data point.
-                cand.dist = dist;
-                // Append the candidate into the warp's candidate buffer in shared memory.
-                int pos = atomicAdd(&warpCandidateCount[warp_id_in_block], 1);
-                warpBuffer_all[warp_id_in_block * k + pos] = cand;
-                // If the buffer becomes full, merge it immediately with the intermediate result.
-                if (pos + 1 == k) {
-                    warp_merge_shared(knn, warpBuffer_all + warp_id_in_block * k,
-                                        k, k, local_n);
-                    // Reset the candidate count.
-                    if (lane == 0) {
-                        warpCandidateCount[warp_id_in_block] = 0;
+        bufDist[i] = bestDist[t];
+        bufIdx[i]  = bestIdx[t];
+    }
+    __syncwarp();
+
+    // Step 2: Sort buffer (now in tmpDist/tmpIdx registers) ascending
+    warp_bitonic_sort(tmpDist, tmpIdx, k, KK, lane);
+
+    __syncwarp();
+
+    // Step 3: Merge buffer and previous result into registers by taking the element-wise minimum
+    // of tmpDist[i] and bufDist[k - 1 - i].
+    for (int t = 0; t < KK; t++) {
+        int i = lane * KK + t;
+        int j = k - 1 - i;
+
+        float other_d = bufDist[j];
+        int   other_i = bufIdx[j];
+
+        float a_d = tmpDist[t];
+        int   a_i = tmpIdx[t];
+
+        bool take_a = (a_d < other_d);
+        bestDist[t] = take_a ? a_d : other_d;
+        bestIdx[t]  = take_a ? a_i : other_i;
+    }
+    __syncwarp();
+
+    // Step 4: Sort the merged result ascending to restore invariant
+    warp_bitonic_sort(bestDist, bestIdx, k, KK, lane);
+
+    __syncwarp();
+
+    // Update maxDist to the k-th element (last one in ascending order).
+    float kth = bestDist[KK - 1];
+    // Broadcast from last lane
+    maxDist = __shfl_sync(FULL_MASK, kth, KNN_WARP_SIZE - 1);
+
+    // Reset buffer count
+    if (lane == 0) {
+        *bufCountPtr = 0;
+    }
+    __syncwarp();
+}
+
+// The main kernel. One warp processes one query point.
+__global__ void knn_kernel(
+    const float2 * __restrict__ query, int query_count,
+    const float2 * __restrict__ data,  int data_count,
+    PairOut * __restrict__ result,
+    int k)
+{
+    // Compute warp and lane identifiers
+    const int lane = threadIdx.x & (KNN_WARP_SIZE - 1);
+    const int warpInBlock = threadIdx.x >> 5; // /32
+    const int warpsPerBlock = blockDim.x >> 5;
+
+    const int queryIdx = blockIdx.x * warpsPerBlock + warpInBlock;
+    if (queryIdx >= query_count) return;
+
+    // Each warp handles a single query
+    const float2 q = query[queryIdx];
+
+    // Per-thread register storage for the intermediate top-k list (ascending order).
+    // Each thread holds k/32 consecutive entries.
+    const int KK = k / KNN_WARP_SIZE; // number of elements per thread
+    float bestDist[KNN_MAX_K / KNN_WARP_SIZE];
+    int   bestIdx [KNN_MAX_K / KNN_WARP_SIZE];
+#pragma unroll
+    for (int t = 0; t < KNN_MAX_K / KNN_WARP_SIZE; t++) {
+        if (t < KK) {
+            bestDist[t] = CUDART_INF_F;
+            bestIdx[t]  = -1;
+        }
+    }
+
+    // Temporary registers used during merge swap (to store buffer contents)
+    float tmpDist[KNN_MAX_K / KNN_WARP_SIZE];
+    int   tmpIdx [KNN_MAX_K / KNN_WARP_SIZE];
+
+    // Shared memory layout:
+    // [0] float2 tile[KNN_TILE_POINTS]
+    // [1] per-warp candidate buffers: dist[warps*k], idx[warps*k]
+    // [2] per-warp candidate counts: int[warps]
+    extern __shared__ unsigned char smem[];
+    size_t off = 0;
+
+    // Shared tile for cached data points
+    float2 *sTile = reinterpret_cast<float2*>(smem + off);
+    off += sizeof(float2) * KNN_TILE_POINTS;
+
+    // Align to 8 bytes for safety
+    off = (off + 7) & ~size_t(7);
+
+    // Candidate buffers for all warps in the block
+    float *candDistBase = reinterpret_cast<float*>(smem + off);
+    off += sizeof(float) * (size_t)warpsPerBlock * (size_t)k;
+
+    int *candIdxBase = reinterpret_cast<int*>(smem + off);
+    off += sizeof(int) * (size_t)warpsPerBlock * (size_t)k;
+
+    // Candidate counters per warp
+    int *candCountBase = reinterpret_cast<int*>(smem + off);
+    // off += sizeof(int) * warpsPerBlock; // Not needed further
+
+    // Pointers for this warp's candidate buffer and count
+    float *myCandDist = candDistBase + (size_t)warpInBlock * (size_t)k;
+    int   *myCandIdx  = candIdxBase  + (size_t)warpInBlock * (size_t)k;
+    volatile int *myCandCount = candCountBase + warpInBlock;
+
+    if (lane == 0) {
+        *myCandCount = 0;
+    }
+    __syncwarp();
+
+    // Current threshold distance: distance of the k-th nearest element in the intermediate result.
+    float maxDist = CUDART_INF_F;
+
+    // Process the data in tiles
+    for (int tileStart = 0; tileStart < data_count; tileStart += KNN_TILE_POINTS) {
+        int tileSize = data_count - tileStart;
+        if (tileSize > KNN_TILE_POINTS) tileSize = KNN_TILE_POINTS;
+
+        // Cooperative loading of the tile into shared memory by the whole block
+        for (int t = threadIdx.x; t < tileSize; t += blockDim.x) {
+            sTile[t] = data[tileStart + t];
+        }
+        __syncthreads();
+
+        // Each warp processes all points in the tile
+        for (int t = lane; t < tileSize; t += KNN_WARP_SIZE) {
+            float2 d = sTile[t];
+            float dist = distance2(q, d);
+
+            // Filter by current maxDist (k-th neighbor distance)
+            int take = (dist < maxDist) ? 1 : 0;
+
+            // Warp ballot to count candidates
+            unsigned mask = __ballot_sync(FULL_MASK, take);
+            int add = __popc(mask);
+
+            if (add > 0) {
+                // If the buffer would overflow, merge it first
+                int needMerge = 0;
+                if (lane == 0) {
+                    int cc = *myCandCount;
+                    if (cc == k || (cc + add > k)) {
+                        needMerge = 1;
                     }
-                    __syncwarp();
+                }
+                needMerge = __shfl_sync(FULL_MASK, needMerge, 0);
+                if (needMerge) {
+                    // Merge the buffer with the intermediate result
+                    warp_merge_buffer_with_result(
+                        bestDist, bestIdx,
+                        tmpDist, tmpIdx,
+                        myCandDist, myCandIdx, myCandCount,
+                        k, KK, lane, maxDist
+                    );
+                }
+
+                // Reserve space in the candidate buffer
+                int base = 0;
+                if (lane == 0) {
+                    int cc = *myCandCount;
+                    *myCandCount = cc + add;
+                    base = cc;
+                }
+                base = __shfl_sync(FULL_MASK, base, 0);
+
+                if (take) {
+                    // Offset of this lane's element within the newly added block
+                    unsigned lower = mask & ((1u << lane) - 1u);
+                    int offset = __popc(lower);
+                    int pos = base + offset;
+                    // Store candidate (we ensured no overflow)
+                    myCandDist[pos] = dist;
+                    myCandIdx[pos]  = tileStart + t;
                 }
             }
         }
-        __syncthreads();  // ensure tile processing is complete for all threads.
-    }
-    // After the last batch, if there remain candidates in the buffer, merge them.
-    int candCount = warpCandidateCount[warp_id_in_block];
-    if (candCount > 0) {
-        warp_merge_shared(knn, warpBuffer_all + warp_id_in_block * k, candCount, k, local_n);
-    }
-    __syncwarp();
 
-    // Write the final sorted k nearest neighbors to global memory.
-    // The distributed array "knn" (of total length k) is stored in row–major order:
-    // thread "lane" contains candidates for global indices [lane*local_n, lane*local_n+local_n-1].
-    int query_base = global_warp_id * k;
-    for (int i = 0; i < local_n; i++) {
-        int out_idx = query_base + (lane * local_n + i);
-        result[out_idx] = std::make_pair(knn[i].idx, knn[i].dist);
+        // If the buffer is full after processing this tile, merge it
+        int needMergeAfterTile = 0;
+        if (lane == 0) {
+            int cc = *myCandCount;
+            if (cc == k) needMergeAfterTile = 1;
+        }
+        needMergeAfterTile = __shfl_sync(FULL_MASK, needMergeAfterTile, 0);
+        if (needMergeAfterTile) {
+            warp_merge_buffer_with_result(
+                bestDist, bestIdx,
+                tmpDist, tmpIdx,
+                myCandDist, myCandIdx, myCandCount,
+                k, KK, lane, maxDist
+            );
+        }
+
+        __syncthreads(); // Ensure all warps finished using sTile before reloading
+    }
+
+    // Final merge if the buffer has remaining candidates
+    int finalMerge = 0;
+    if (lane == 0) {
+        int cc = *myCandCount;
+        if (cc > 0) finalMerge = 1;
+    }
+    finalMerge = __shfl_sync(FULL_MASK, finalMerge, 0);
+    if (finalMerge) {
+        warp_merge_buffer_with_result(
+            bestDist, bestIdx,
+            tmpDist, tmpIdx,
+            myCandDist, myCandIdx, myCandCount,
+            k, KK, lane, maxDist
+        );
+    }
+
+    // Write out the results for this query in row-major order:
+    // result[queryIdx * k + j] = (index, distance), j in [0, k)
+    size_t outBase = (size_t)queryIdx * (size_t)k;
+    for (int t = 0; t < KK; t++) {
+        int j = lane * KK + t;
+        PairOut out;
+        out.first  = bestIdx[t];
+        out.second = bestDist[t];
+        result[outBase + j] = out;
     }
 }
 
-// ----------------------------------------------------------------------
-// Host function that launches the k-NN kernel.
-// The input arrays "query", "data", and "result" are assumed to be allocated using cudaMalloc().
-void run_knn(const float2 *query, int query_count,
-             const float2 *data, int data_count,
-             std::pair<int, float> *result, int k) {
-    // Choose an appropriate block size.
-    int blockSize = 128;  // number of threads per block (must be a multiple of 32)
-    int warpsPerBlock = blockSize / 32;
-    // Each warp processes one query. Compute grid size accordingly.
-    int numBlocks = (query_count + warpsPerBlock - 1) / warpsPerBlock;
+// Host function to launch the kernel.
+// query: device pointer to float2 query points
+// data: device pointer to float2 data points
+// result: device pointer to std::pair<int, float> results (treated as PairOut here)
+// k: power of two in [32, 1024]
+void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
+    if (query_count <= 0 || data_count <= 0 || k <= 0) return;
 
-    // Define tile size (for data batching) consistent with knn_kernel.
-    const int TILE_SIZE = 256;
-    // Compute the shared memory size (in bytes):
-    //   - Each block has warpsPerBlock candidate buffers, each of size k Candidates.
-    //   - Plus warpsPerBlock candidate count integers.
-    //   - Plus a data tile buffer of TILE_SIZE float2 elements.
-    size_t sharedMemSize = warpsPerBlock * k * sizeof(Candidate)
-                         + warpsPerBlock * sizeof(int)
-                         + TILE_SIZE * sizeof(float2);
+    const int threadsPerBlock = KNN_THREADS_PER_BLOCK; // multiple of 32
+    const int warpsPerBlock = threadsPerBlock / KNN_WARP_SIZE;
+    const int blocks = (query_count + warpsPerBlock - 1) / warpsPerBlock;
 
-    // Launch the kernel.
-    knn_kernel<<<numBlocks, blockSize, sharedMemSize>>>(query, query_count, data, data_count, result, k);
-    // (Error checking omitted for brevity.)
+    // Compute dynamic shared memory size:
+    // tile: KNN_TILE_POINTS * sizeof(float2)
+    // per-warp candidate buffers: warpsPerBlock * k * (sizeof(float) + sizeof(int))
+    // per-warp counts: warpsPerBlock * sizeof(int)
+    size_t smem_size = 0;
+    smem_size += sizeof(float2) * (size_t)KNN_TILE_POINTS;
+    // Align to 8
+    smem_size = (smem_size + 7) & ~size_t(7);
+    smem_size += (size_t)warpsPerBlock * (size_t)k * (sizeof(float) + sizeof(int));
+    smem_size += sizeof(int) * (size_t)warpsPerBlock;
+
+    PairOut *out = reinterpret_cast<PairOut*>(result);
+
+    knn_kernel<<<blocks, threadsPerBlock, smem_size>>>(query, query_count, data, data_count, out, k);
 }

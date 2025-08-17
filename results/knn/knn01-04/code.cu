@@ -1,202 +1,211 @@
 #include <cuda_runtime.h>
-#include <cfloat>
-#include <utility>  // for std::pair
+#include <cub/cub.cuh>
+#include <utility>
 
-// -----------------------------------------------------------------------------
-// This kernel performs k-nearest neighbors search for a single 2D query point.
-// Each block is responsible for one query point. Inside each block, a fixed
-// number of threads cooperatively scan all data points to compute the
-// k smallest squared Euclidean distances. Each thread processes a strided
-// portion from the global "data" array and maintains a small, local candidate
-// list (of fixed size THREAD_CAND) of best neighbors seen in its portion.
-// Then, all threads write their local candidate lists into shared memory;
-// a bitonic sort is performed in shared memory to sort all candidates by
-// distance (ascending order). Finally, the best k candidates (i.e., the first
-// k elements of the sorted list) are written out to global memory.
-// -----------------------------------------------------------------------------
+// Optimized k-NN (top-k) for 2D points using a single block per query.
+// Strategy:
+// - Each block processes one query and streams through the entire dataset in tiles.
+// - For each tile, threads compute distances and cooperatively sort the tile using
+//   CUB's BlockRadixSort (sorting key-value pairs: distance, index).
+// - Only the smallest k entries from the current tile are retained (stored in shared memory).
+// - These k entries are merged with the running global top-k for the query by sorting
+//   the union of size up to 2k using another BlockRadixSort; the smallest k are kept.
+// - This approach is correct and efficient: the global top-k must belong to the union
+//   of the per-tile top-k sets (any element not in a tile's top-k has at least k
+//   elements in the same tile that are smaller, so it cannot belong to the global top-k).
+// - All work is done in-place with registers, static shared memory (for CUB temp storage),
+//   and dynamic shared memory (for only 2k entries), without any device allocations.
 //
-// Hyper-parameter: number of candidates maintained per thread.
-// Chosen as a fixed constant (8) such that (blockDim.x * THREAD_CAND) is always
-// at least k. (For worst-case k = 1024 and typical blockDim.x = 256, we have
-// 256*8 = 2048 candidates to merge.)
+// Assumptions (as per problem statement):
+// - k is a power of two in [32, 1024].
+// - data_count >= k.
+// - Inputs are large enough to benefit from GPU parallelism.
+// - Arrays are allocated by cudaMalloc; result is an array of std::pair<int, float>.
 //
-#define THREAD_CAND 8
+// Tuning choices:
+// - BLOCK_THREADS = 256: good occupancy and memory coalescing on A100/H100.
+// - TILE_ITEMS_PER_THREAD = 8: per tile we sort 256*8 = 2048 items, a good balance
+//   between shared memory usage and sort overhead.
+// - MERGE_ITEMS_PER_THREAD = 8: capacity for merging up to 2k = 2048 items when k=1024.
+//
+// Notes on memory usage per block:
+// - Dynamic shared memory: 2 * k * (sizeof(float) + sizeof(int)) = 8*k bytes (<= 8KB).
+// - Static shared memory: CUB BlockRadixSort temp storage (reused via a union).
+// - Fits within default per-block shared memory limits on A100/H100 without extra attributes.
 
-// -----------------------------------------------------------------------------
-// Device kernel: each block processes one query point.
-__global__ void knn_kernel(const float2 *query, int query_count,
-                           const float2 *data, int data_count,
-                           std::pair<int, float>* result, int k)
+template <int BLOCK_THREADS, int TILE_ITEMS_PER_THREAD, int MERGE_ITEMS_PER_THREAD>
+__global__ void knn2d_kernel(const float2* __restrict__ query,
+                             int query_count,
+                             const float2* __restrict__ data,
+                             int data_count,
+                             std::pair<int, float>* __restrict__ result,
+                             int k)
 {
-    // Each block handles one query point.
-    int qid = blockIdx.x;
+    using KeyT = float;
+    using ValT = int;
+
+    // Block-wide radix sort types for the tile sort and the merge sort.
+    using TileSort  = cub::BlockRadixSort<KeyT, BLOCK_THREADS, TILE_ITEMS_PER_THREAD, ValT>;
+    using MergeSort = cub::BlockRadixSort<KeyT, BLOCK_THREADS, MERGE_ITEMS_PER_THREAD, ValT>;
+
+    // Reuse the same static shared memory region for the two sorts via a union.
+    __shared__ union {
+        typename TileSort::TempStorage  tile_sort;
+        typename MergeSort::TempStorage merge_sort;
+    } sort_storage;
+
+    // Dynamic shared memory layout:
+    // [ topk_keys (k) | topk_vals (k) | tile_k_keys (k) | tile_k_vals (k) ]
+    extern __shared__ unsigned char smem[];
+    unsigned char* sptr = smem;
+
+    KeyT* s_topk_keys = reinterpret_cast<KeyT*>(sptr);       sptr += sizeof(KeyT) * k;
+    ValT* s_topk_vals = reinterpret_cast<ValT*>(sptr);       sptr += sizeof(ValT) * k;
+    KeyT* s_tilek_keys = reinterpret_cast<KeyT*>(sptr);      sptr += sizeof(KeyT) * k;
+    ValT* s_tilek_vals = reinterpret_cast<ValT*>(sptr);      // end
+
+    const int qid = blockIdx.x;
     if (qid >= query_count) return;
 
-    // Load the query point from global memory.
-    float2 qPoint = query[qid];
-
-    // Number of threads in the block.
-    const int tN = blockDim.x;
-
-    // Each thread maintains a local candidate list (of length THREAD_CAND)
-    // storing the index and squared distance.
-    int localIdx[THREAD_CAND];
-    float localDist[THREAD_CAND];
-
-    // Initialize local candidate list with "worst" values.
-    for (int i = 0; i < THREAD_CAND; i++) {
-        localDist[i] = FLT_MAX;
-        localIdx[i] = -1;
-    }
-
-    // Each thread loops over a chunk of the data points in a strided manner.
-    // For each data point in its portion, compute the squared Euclidean distance.
-    // Then, if the distance is smaller than the worst one in its local candidate
-    // list, update the list.
-    for (int i = threadIdx.x; i < data_count; i += tN) {
-        float2 dPoint = data[i];
-        float dx = dPoint.x - qPoint.x;
-        float dy = dPoint.y - qPoint.y;
-        float dist = dx * dx + dy * dy;
-
-        // Linear search of the current local candidate list for the worst candidate.
-        int worstIdx = 0;
-        float worstVal = localDist[0];
-        #pragma unroll
-        for (int j = 1; j < THREAD_CAND; j++) {
-            float val = localDist[j];
-            if (val > worstVal) {
-                worstVal = val;
-                worstIdx = j;
-            }
-        }
-        // If the new distance is better than the worst stored, update.
-        if (dist < worstVal) {
-            localDist[worstIdx] = dist;
-            localIdx[worstIdx] = i;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Now, each thread has a local candidate list of THREAD_CAND elements.
-    // We need to merge the results from all threads.
-    //
-    // We use shared memory to hold all candidate pairs from the block.
-    // Total number of candidates is: totalCand = tN * THREAD_CAND.
-    // We allocate shared memory dynamically. The layout is as follows:
-    // [  int s_idx[totalCand] | float s_dist[totalCand] ]
-    //
-    int totalCand = tN * THREAD_CAND;
-    extern __shared__ char smem[];
-    int *s_idx = (int*) smem;
-    float *s_dist = (float*) (s_idx + totalCand);
-
-    // Each thread copies its local candidate list to shared memory.
-    int offset = threadIdx.x * THREAD_CAND;
-    #pragma unroll
-    for (int j = 0; j < THREAD_CAND; j++) {
-        s_idx[offset + j]  = localIdx[j];
-        s_dist[offset + j] = localDist[j];
+    // Load the query point once per block into shared memory to avoid redundant global loads.
+    __shared__ float2 q_sh;
+    if (threadIdx.x == 0) {
+        q_sh = query[qid];
     }
     __syncthreads();
 
-    // -------------------------------------------------------------------------
-    // Perform an in-block bitonic sort on the shared candidates.
-    // Sort order: ascending by distance.
-    // We assume totalCand is a power of two. For example, with tN = 256 and
-    // THREAD_CAND = 8, totalCand = 2048.
-    //
-    // Bitonic sort algorithm:
-    //  for (size = 2; size <= totalCand; size *= 2)
-    //    for (stride = size/2; stride > 0; stride /= 2)
-    //      for each index i in 0 .. totalCand-1 (each handled by some thread):
-    //          int ixj = i ^ stride;
-    //          if (ixj > i) then
-    //              if ( (i & size)==0 ? (s_dist[i] > s_dist[ixj])
-    //                                   : (s_dist[i] < s_dist[ixj]) )
-    //                  swap(s_dist[i], s_dist[ixj]); swap(s_idx[i], s_idx[ixj]);
-    //
-    for (int size = 2; size <= totalCand; size *= 2) {
-        for (int stride = size / 2; stride > 0; stride /= 2) {
-            // Each thread processes multiple indices with stride equal to tN.
-            for (int i = threadIdx.x; i < totalCand; i += tN) {
-                int ixj = i ^ stride;
-                if (ixj > i) {
-                    // Determine the sort direction: ascending if (i & size) == 0.
-                    bool ascending = ((i & size) == 0);
-                    // Compare and swap based on ascending order.
-                    if (ascending) {
-                        if (s_dist[i] > s_dist[ixj]) {
-                            float tmpD = s_dist[i];
-                            s_dist[i] = s_dist[ixj];
-                            s_dist[ixj] = tmpD;
+    const float qx = q_sh.x;
+    const float qy = q_sh.y;
 
-                            int tmpIdx = s_idx[i];
-                            s_idx[i] = s_idx[ixj];
-                            s_idx[ixj] = tmpIdx;
-                        }
-                    } else {
-                        if (s_dist[i] < s_dist[ixj]) {
-                            float tmpD = s_dist[i];
-                            s_dist[i] = s_dist[ixj];
-                            s_dist[ixj] = tmpD;
+    const int TILE_SIZE = BLOCK_THREADS * TILE_ITEMS_PER_THREAD;
+    const KeyT INF = CUDART_INF_F;
 
-                            int tmpIdx = s_idx[i];
-                            s_idx[i] = s_idx[ixj];
-                            s_idx[ixj] = tmpIdx;
-                        }
-                    }
-                }
+    int cur_k_count = 0; // number of valid entries in s_topk_* arrays
+
+    // Stream through data in tiles of TILE_SIZE elements.
+    for (int tile_start = 0; tile_start < data_count; tile_start += TILE_SIZE) {
+
+        const int tile_valid = min(TILE_SIZE, data_count - tile_start);
+
+        // Load distances and indices for this tile into per-thread registers.
+        KeyT keys_tile[TILE_ITEMS_PER_THREAD];
+        ValT vals_tile[TILE_ITEMS_PER_THREAD];
+
+        #pragma unroll
+        for (int i = 0; i < TILE_ITEMS_PER_THREAD; ++i) {
+            int idx = tile_start + threadIdx.x + i * BLOCK_THREADS;
+            if (idx < data_count) {
+                float2 p = data[idx];
+                float dx = p.x - qx;
+                float dy = p.y - qy;
+                // Squared L2 distance
+                KeyT d2 = fmaf(dy, dy, dx * dx);
+                keys_tile[i] = d2;
+                vals_tile[i] = idx;
+            } else {
+                keys_tile[i] = INF; // pad with +inf to keep processing simple
+                vals_tile[i] = -1;
             }
-            __syncthreads();
         }
+
+        // Sort the tile (blocked-to-blocked): after this, thread t owns the items in
+        // global sorted positions [t*IPT, t*IPT + IPT).
+        TileSort(sort_storage.tile_sort).SortBlockedToBlocked(keys_tile, vals_tile);
+        __syncthreads(); // ensure sort_storage reuse safety
+
+        // Keep only the smallest tile_k entries from this tile.
+        const int tile_k = (tile_valid < k) ? tile_valid : k;
+
+        // Write the smallest tile_k items from registers to shared memory buffer s_tilek_*.
+        // Each thread writes the portion of [0, tile_k) that it owns after the blocked sort.
+        {
+            const int base = threadIdx.x * TILE_ITEMS_PER_THREAD;
+            int count = tile_k - base;
+            if (count > TILE_ITEMS_PER_THREAD) count = TILE_ITEMS_PER_THREAD;
+            if (count < 0) count = 0;
+
+            #pragma unroll
+            for (int i = 0; i < count; ++i) {
+                s_tilek_keys[base + i] = keys_tile[i];
+                s_tilek_vals[base + i] = vals_tile[i];
+            }
+        }
+        __syncthreads();
+
+        // Merge current top-k and this tile's top-k by sorting their union (size <= 2k).
+        // Build the union in per-thread registers (blocked layout), padding with +inf as needed.
+        KeyT keys_merge[MERGE_ITEMS_PER_THREAD];
+        ValT vals_merge[MERGE_ITEMS_PER_THREAD];
+
+        const int union_total = cur_k_count + tile_k; // <= 2k by construction
+
+        #pragma unroll
+        for (int j = 0; j < MERGE_ITEMS_PER_THREAD; ++j) {
+            int pos = threadIdx.x * MERGE_ITEMS_PER_THREAD + j;
+            if (pos < cur_k_count) {
+                keys_merge[j] = s_topk_keys[pos];
+                vals_merge[j] = s_topk_vals[pos];
+            } else if (pos < union_total) {
+                int tpos = pos - cur_k_count;
+                keys_merge[j] = s_tilek_keys[tpos];
+                vals_merge[j] = s_tilek_vals[tpos];
+            } else {
+                keys_merge[j] = INF;
+                vals_merge[j] = -1;
+            }
+        }
+
+        // Sort the union and keep the smallest k into s_topk_*.
+        MergeSort(sort_storage.merge_sort).SortBlockedToBlocked(keys_merge, vals_merge);
+        __syncthreads(); // ensure sort_storage reuse safety
+
+        #pragma unroll
+        for (int j = 0; j < MERGE_ITEMS_PER_THREAD; ++j) {
+            int pos = threadIdx.x * MERGE_ITEMS_PER_THREAD + j;
+            if (pos < k) {
+                s_topk_keys[pos] = keys_merge[j];
+                s_topk_vals[pos] = vals_merge[j];
+            }
+        }
+        __syncthreads();
+
+        cur_k_count = (union_total < k) ? union_total : k;
     }
 
-    // -------------------------------------------------------------------------
-    // After the bitonic sort the first k elements in shared memory correspond
-    // to the k smallest distances.
-    // Write out the sorted k results to the output global array.
-    // Each result is a pair: (data index, squared distance).
-    for (int i = threadIdx.x; i < k; i += tN) {
-        // Write result for query 'qid' at result offset (qid * k + i)
-        result[qid * k + i] = std::make_pair(s_idx[i], s_dist[i]);
+    // Store results for this query in ascending distance order.
+    // Each thread writes a striped subset of the k results.
+    std::pair<int, float>* out = result + static_cast<size_t>(qid) * static_cast<size_t>(k);
+    for (int j = threadIdx.x; j < k; j += BLOCK_THREADS) {
+        // Write fields individually to avoid invoking any std::pair constructors on device.
+        out[j].first  = s_topk_vals[j];
+        out[j].second = s_topk_keys[j];
     }
-    // End of kernel.
 }
 
-// -----------------------------------------------------------------------------
-// Host interface: run_knn
-//
-// Parameters:
-//   query       - pointer to queries (each a float2)
-//   query_count - number of query points
-//   data        - pointer to dataset points (each a float2)
-//   data_count  - number of data points (>= k)
-//   result      - pointer to output array where each query gets k results;
-//                 result[i*k + j] corresponds to j-th nearest neighbor for query[i].
-//   k           - number of nearest neighbors to retrieve (power of two between 32 and 1024)
-// -----------------------------------------------------------------------------
-/// @FIXED
-/// extern "C" void run_knn(const float2 *query, int query_count,
+// Host interface
 void run_knn(const float2 *query, int query_count,
-                        const float2 *data, int data_count,
-                        std::pair<int, float> *result, int k)
+             const float2 *data, int data_count,
+             std::pair<int, float> *result, int k)
 {
-    // Choose block size; here we use 256 threads per block.
-    const int blockSize = 256;
-    // One query point is processed per block.
-    int gridSize = query_count;
+    // Tuned launch configuration for A100/H100:
+    // - 256 threads per block
+    // - Each block processes one query
+    // - Dynamic shared memory sized to hold 2*k (distance,index) pairs.
+    constexpr int BLOCK_THREADS = 256;
+    constexpr int TILE_ITEMS_PER_THREAD = 8;   // 256*8 = 2048 elements per tile
+    constexpr int MERGE_ITEMS_PER_THREAD = 8;  // 256*8 = 2048 capacity for up to 2k elements
 
-    // Calculate the amount of shared memory required per block.
-    // We need to allocate shared memory for totalCand candidate indices and distances.
-    // totalCand = blockSize * THREAD_CAND.
-    // Shared memory bytes = totalCand * (sizeof(int) + sizeof(float))
-    int totalCand = blockSize * THREAD_CAND;
-    int sharedMemBytes = totalCand * (sizeof(int) + sizeof(float));
+    dim3 block(BLOCK_THREADS);
+    dim3 grid(query_count);
 
-    // Launch the kernel.
-    knn_kernel<<<gridSize, blockSize, sharedMemBytes>>>(query, query_count,
-                                                        data, data_count,
-                                                        result, k);
-    // It is assumed that the caller checks for errors and synchronizes as needed.
+    // Dynamic shared memory needed per block:
+    // top-k (k) + tile-k (k), each having (float distance + int index).
+    size_t smem_bytes = static_cast<size_t>(2) * static_cast<size_t>(k) * (sizeof(float) + sizeof(int));
+
+    knn2d_kernel<BLOCK_THREADS, TILE_ITEMS_PER_THREAD, MERGE_ITEMS_PER_THREAD>
+        <<<grid, block, smem_bytes>>>(query, query_count, data, data_count, result, k);
+
+    // Optionally, synchronize or check for errors in production code.
+    // cudaDeviceSynchronize();
+    // cudaGetLastError();
 }

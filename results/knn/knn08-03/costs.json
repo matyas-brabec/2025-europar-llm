@@ -1,11 +1,11 @@
 {
-  "prompt_uncached_tokens": 1355,
-  "prompt_uncached_cost": 0.0014905,
-  "prompt_cached_tokens": 0,
-  "prompt_cached_cost": 0.0,
-  "output_tokens": 3513,
-  "cost_output": 0.0154572,
-  "reasoning_tokens": 17856,
-  "cost_reasoning": 0.07856640000000001,
-  "total_cost": 0.0955141
+  "prompt_uncached_tokens": 75,
+  "prompt_uncached_cost": 9.375e-05,
+  "prompt_cached_tokens": 1280,
+  "prompt_cached_cost": 0.0008,
+  "output_tokens": 4272,
+  "cost_output": 0.04272,
+  "reasoning_tokens": 23360,
+  "cost_reasoning": 0.23360000000000003,
+  "total_cost": 0.27721375000000004
 }
