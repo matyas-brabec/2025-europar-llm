@@ -12,7 +12,7 @@ To use OpenAI (paid API):
 * Create an API key: <https://platform.openai.com/api-keys>
 * Rename `.env.example` to `.env` and save the API key there
 
-If you want to use a different LLM, you can modify the `MODEL` variable in the `main.py` file. The default is set to `o3-mini-2025-01-31`, which is the latest OpenAI model as of January 2025. Note that requests to other models may incur different costs and require different API keys (or also different API configurations).
+If you want to use a different LLM, you can modify the `MODEL` variable in the `main.py` file. The default is set to `gpt-5-2025-08-07`, which is the latest OpenAI model as of August 2025. Note that requests to other models may incur different costs and require different API keys (or also different API configurations).
 
 ## Usage
 
