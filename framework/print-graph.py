@@ -139,7 +139,7 @@ df_references = df_references[(df_references['verified'] == True) & (df_referenc
 
 # Extract solution class from experiment_id (e.g., "game_of_life01" from "game_of_life01-01/gol").
 def extract_solution_class(experiment_id):
-    match = re.match(r'((histogram|game_of_life)\d+(?:_[a-zA-Z]+)?)', experiment_id)
+    match = re.match(r'((histogram|game_of_life|knn)\d+(?:_[a-zA-Z]+)?)', experiment_id)
     if match:
         return match.group(1)
     return experiment_id
