@@ -56,6 +56,30 @@
             "best-possible/code"
         ]
     },
+    "knn": {
+        "title": "K-Nearest Neighbors",
+        "class_ids_to_labels": {
+            "knn01": "01",
+            "knn02": "02",
+            "knn03": "03",
+            "knn04": "04",
+            "knn05": "05",
+            "knn06": "06",
+            "knn07": "07",
+            "knn08": "08"
+        },
+        "y_label": "Time [ms]",
+        "references_labels": {
+            "baseline/code": "Baseline",
+            "baseline-warps/code": "Baseline (warps)",
+            "naive/code": "Naïve"
+        },
+        "included_references_ids": [
+            "baseline/code",
+            "baseline-warps/code",
+            "naive/code"
+        ]
+    },
     "single-graph-style":{
         "style": {
             "font_sizes": {
@@ -117,7 +141,8 @@
                 "grid_line_width": 0.5,
                 "grid_alpha": 0.7,
                 "legend_y_offset": 0.13
-            }
+            },
+            "use_tex": true
         }
     },
     "first-graph": {
@@ -146,9 +171,6 @@
         "style": {
             "figure": {
                 "log_scale": true
-            },
-            "layout": {
-                "legend_position": "lower left"
             }
         }
     },
@@ -156,6 +178,13 @@
         "y_axis_from_to": null
     },
     "narrow-hist": {
+        "style": {
+            "figure": {
+                "height": 3.8
+            }
+        }
+    },
+    "narrow-knn": {
         "style": {
             "figure": {
                 "height": 3.8
