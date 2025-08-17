@@ -340,7 +340,9 @@ __global__ void knn2d_kernel(const float2* __restrict__ query,
 // query: device pointer to float2 queries, count q
 // data:  device pointer to float2 data points, count n
 // result: device pointer to std::pair<int,float> of size q*k
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k)
 {
     if (query_count <= 0 || data_count <= 0 || k <= 0) return;

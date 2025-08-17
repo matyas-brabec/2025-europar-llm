@@ -454,7 +454,9 @@ void launch_knn_kernel(const float2* query, int query_count,
     );
 }
 
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_knn(const float2 *query, int query_count,
              const float2 *data, int data_count,
              std::pair<int, float> *result, int k) {

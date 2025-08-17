@@ -356,7 +356,9 @@ __global__ void knn_kernel(const float2* __restrict__ queries,
 }
 
 // Host-side launcher conforming to the requested interface.
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_knn(const float2 *query, int query_count,
              const float2 *data, int data_count,
              std::pair<int, float> *result, int k)

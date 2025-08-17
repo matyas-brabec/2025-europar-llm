@@ -249,7 +249,9 @@ __global__ void knn_kernel_2d(
     float* w_inter_dist= reinterpret_cast<float*>(w_cand_idx + k);
     int*   w_inter_idx = reinterpret_cast<int*>(w_inter_dist + k);
     volatile int*   w_cand_count = reinterpret_cast<volatile int*>(w_inter_idx + k);
-    volatile float* w_max_dist   = reinterpret_cast<volatile float*>(const_cast<int*>(reinterpret_cast<const int*>(w_cand_count)) + 1);
+    /// @FIXED
+    /// volatile float* w_max_dist   = reinterpret_cast<volatile float*>(const_cast<int*>(reinterpret_cast<const int*>(w_cand_count)) + 1);
+    volatile float* w_max_dist   = reinterpret_cast<volatile float*>(const_cast<int*>(w_cand_count) + 1);
 
     // Initialize per-warp structures
     if (query_idx < query_count)

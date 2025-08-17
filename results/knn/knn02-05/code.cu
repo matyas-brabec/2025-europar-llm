@@ -322,7 +322,9 @@ void run_knn(const float2 *query, int query_count,
     int device = 0;
     cudaGetDevice(&device);
     int maxDynSmem = 0;
-    cudaDeviceGetAttribute(&maxDynSmem, cudaDevAttrMaxDynamicSharedMemorySize, device);
+    /// @FIXED
+    /// cudaDeviceGetAttribute(&maxDynSmem, cudaDevAttrMaxDynamicSharedMemorySize, device);
+    cudaDeviceGetAttribute(&maxDynSmem, cudaDevAttrMaxSharedMemoryPerBlock, device);
     if ((int)smem_bytes <= maxDynSmem) {
         cudaFuncSetAttribute(knn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
     }

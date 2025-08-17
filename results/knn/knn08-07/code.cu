@@ -348,8 +348,16 @@ __global__ void knn2d_kernel(const float2* __restrict__ query,
                     base_pos = __shfl_sync(0xFFFFFFFFu, base_pos, 0);
 
                     // Compute rank of this lane among the true bits for coalesced writes.
-#if __CUDACC_VER_MAJOR__ >= 9
+/// @FIXED
+/// #if __CUDACC_VER_MAJOR__ >= 9
+#if __CUDACC_VER_MAJOR__ >= 9 && __CUDACC_VER_MAJOR__ < 11
                     unsigned lane_mask_lt = __lanemask_lt();
+/// @FIXED
+#elif __CUDACC_VER_MAJOR__ >= 11
+/// @FIXED
+                    unsigned lane_mask_lt;
+/// @FIXED
+                    asm("mov.u32 %0, %lanemask_lt;" : "=r"(lane_mask_lt));
 #else
                     unsigned lane_mask_lt = (1u << lane) - 1u; // Fallback; lane=31 yields undefined shift, but this path is for older toolkits.
 #endif

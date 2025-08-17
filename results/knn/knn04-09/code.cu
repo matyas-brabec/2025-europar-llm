@@ -146,7 +146,9 @@ void warp_bitonic_sort_pairs(PairIF *arr, int count) {
     }
 }
 
-extern "C" __global__
+/// @FIXED
+/// extern "C" __global__
+__global__
 void knn_kernel_2d(const float2 * __restrict__ query,
                    int query_count,
                    const float2 * __restrict__ data,
@@ -292,7 +294,9 @@ void knn_kernel_2d(const float2 * __restrict__ query,
 // Host-side launcher that configures tile size and block dimensions based on available shared memory.
 // - Uses dynamic shared memory for both the data tile and per-warp sorting scratch.
 // - Attempts to opt-in to maximum dynamic shared memory per block for data center GPUs (A100/H100).
-extern "C"
+/// @FIXED
+/// extern "C"
+
 void run_knn(const float2 *query, int query_count,
              const float2 *data, int data_count,
              std::pair<int, float> *result, int k)
@@ -305,7 +309,9 @@ void run_knn(const float2 *query, int query_count,
     cudaGetDeviceProperties(&prop, device);
 
     int maxOptin = 0;
-    cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxDynamicSharedMemoryPerBlockOptin, device);
+    /// @FIXED
+    /// cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxDynamicSharedMemoryPerBlockOptin, device);
+    cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     size_t maxDynSmem = (maxOptin > 0) ? (size_t)maxOptin : (size_t)prop.sharedMemPerBlock;
 
     // Choose number of warps per block to balance occupancy and shared memory usage.

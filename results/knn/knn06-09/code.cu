@@ -212,11 +212,15 @@ __global__ void knn_kernel_2d(
 
     float2* tile = reinterpret_cast<float2*>(base);
     size_t off = tile_elems * sizeof(float2);
-    off = round_up(off, 16);
+    /// @FIXED
+    /// off = round_up(off, 16);
+    off = (off + 15) & ~15;
 
     int* cand_counts = reinterpret_cast<int*>(base + off);
     off += WARPS_PER_BLOCK * sizeof(int);
-    off = round_up(off, 16);
+    /// @FIXED
+    /// off = round_up(off, 16);
+    off = (off + 15) & ~15;
 
     float* top_dist_all = reinterpret_cast<float*>(base + off);
     off += size_t(WARPS_PER_BLOCK) * size_t(k) * sizeof(float);

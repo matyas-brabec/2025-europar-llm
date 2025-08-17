@@ -510,7 +510,9 @@ void run_knn(const float2* query, int query_count,
     };
     cudaLaunchKernel((const void*)&knn_kernel,
                      dim3(blocks), dim3(threads_per_block),
-                     nullptr, (size_t)dyn_smem_bytes, nullptr, args, nullptr);
+                     /// @FIXED
+                     /// nullptr, (size_t)dyn_smem_bytes, nullptr, args, nullptr);
+                     args, (size_t)dyn_smem_bytes);
 
     // Optional sync or error checking can be performed by the caller as desired.
 }

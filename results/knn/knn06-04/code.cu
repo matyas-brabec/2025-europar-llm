@@ -353,7 +353,9 @@ __global__ void knn_kernel_2d(
 }
 
 // Host interface
-extern "C" void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
+/// @FIXED
+/// extern "C" void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
+void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
     // Choose block and grid configuration.
     // We use 256 threads per block (8 warps). Each warp processes one query.
     const int threadsPerBlock = 256;

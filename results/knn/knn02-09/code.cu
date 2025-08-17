@@ -250,7 +250,9 @@ void run_knn(const float2 *query, int query_count,
 
     int max_dyn_shmem = 0;
     // Hopper/Ampere support opt-in dynamic shared memory sizes; fall back to legacy if needed
-    cudaDeviceGetAttribute(&max_dyn_shmem, cudaDevAttrMaxDynamicSharedMemoryPerBlockOptin, device);
+    /// @FIXED
+    /// cudaDeviceGetAttribute(&max_dyn_shmem, cudaDevAttrMaxDynamicSharedMemoryPerBlockOptin, device);
+    cudaDeviceGetAttribute(&max_dyn_shmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (max_dyn_shmem == 0) {
         max_dyn_shmem = prop.sharedMemPerBlockOptin ? prop.sharedMemPerBlockOptin : prop.sharedMemPerBlock;
     }
