@@ -1,11 +1,20 @@
 # 🔬🤖 Tutoring LLM into a Better CUDA Optimizer ⚡🎯
 
-[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![zenodo](https://img.shields.io/badge/zenodo-10.5281/zenodo.15580207-blue)](https://doi.org/10.5281/zenodo.15580207) [![DOI](https://img.shields.io/badge/DOI-TODO-blue)](todo)
+[![LICENSE](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE) [![zenodo](https://img.shields.io/badge/zenodo-10.5281/zenodo.15580207-blue)](https://doi.org/10.5281/zenodo.15580207) [![DOI](https://img.shields.io/badge/DOI-10.1007/978--3--031--99857--7__18-blue)](https://doi.org/10.1007/978-3-031-99857-7_18)
 
 This repository contains the replication package for the paper titled *"Tutoring LLM into a Better CUDA Optimizer"* presented at Euro-Par 2025.
 
 ```bibtex
-@inproceedings { TODO }
+@inproceedings{brabec2025tutoring,
+  title={Tutoring {LLM} into a Better {CUDA} Optimizer},
+  author={Brabec, Maty{\'a}{\v{s}} and Klepl, Ji{\v{r}}{\'{\i}} and T{\"o}pfer, Michal and Kruli{\v{s}}, Martin},
+  booktitle={31st International European Conference on Parallel and Distributed Computing (Euro-Par 2025)},
+  year={2025},
+  pages={250--263},
+  publisher={Springer Nature},
+  doi={10.1007/978-3-031-99857-7_18},
+  url={https://link.springer.com/chapter/10.1007/978-3-031-99857-7_18}
+}
 ```
 
 ## About 🧠💡
