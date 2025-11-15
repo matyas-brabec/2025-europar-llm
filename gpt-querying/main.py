@@ -77,7 +77,7 @@ def load_messages(system_filename: Path, user_filename: Path) -> list[dict[str, 
 
 def extract_code_block(response_text: str) -> str | None:
     # This regex looks for content between triple backticks, possibly with a language specifier.
-    pattern = r"```(?:\w*\n)?(.*?)```"
+    pattern = r"```(?:\w*\+*\n)?(.*?)```"
     matches = re.findall(pattern, response_text, re.DOTALL)
     if matches:
         return matches[0].strip()
@@ -247,9 +247,18 @@ def main():
     prepare_batch_file(system_prompt, knn_prompts, results_folder / "knn-request.jsonl", repetitions=10)
 
     # Process batch LLM responses (uncomment desired line)
-    # parse_batch_output(results_folder / "histogram-response.jsonl", results_folder / "histogram")
-    # parse_batch_output(results_folder / "gol-response.jsonl", results_folder / "gol")
-    # parse_batch_output(results_folder / "knn-response.jsonl", results_folder / "knn")
+    try:
+        parse_batch_output(results_folder / "histogram-response.jsonl", results_folder / "histogram")
+    except Exception as e:
+        print(f"Error parsing histogram batch output: {e}")
+    try:
+        parse_batch_output(results_folder / "gol-response.jsonl", results_folder / "gol")
+    except Exception as e:
+        print(f"Error parsing gol batch output: {e}")
+    try:
+        parse_batch_output(results_folder / "knn-response.jsonl", results_folder / "knn")
+    except Exception as e:
+        print(f"Error parsing knn batch output: {e}")
 
 
     # Select assignment for local execution (uncomment desired line)
