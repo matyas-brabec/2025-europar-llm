@@ -34,7 +34,9 @@ static constexpr int TILE_POINTS        = 1024;    // data tile size cached per 
 static constexpr int MAX_K              = 1024;    // maximum supported k (power of two)
 static constexpr int MAX_ITEMS_PER_THREAD = (2 * MAX_K) / WARP_SIZE; // for union size up to 2*MAX_K
 
-using WarpSortT = cub::WarpRadixSort<float, WARP_SIZE, MAX_ITEMS_PER_THREAD, int>;
+/// @FIXED
+/// using WarpSortT = cub::WarpRadixSort<float, WARP_SIZE, MAX_ITEMS_PER_THREAD, int>;
+using WarpSortT = cub::WarpMergeSort<float, MAX_ITEMS_PER_THREAD, WARP_SIZE, int>;
 
 // -----------------------------------------------------------------------------
 // Merge candidate buffer with current top-k for one warp using warp-wide
@@ -113,7 +115,9 @@ void merge_buffer_warp(
     }
 
     // 3. Warp-wide radix sort of union (in registers) by distance.
-    WarpSortT(warp_sort_temp[warp_id_in_block]).SortPairs(sort_keys, sort_vals);
+    /// @FIXED
+    /// WarpSortT(warp_sort_temp[warp_id_in_block]).SortPairs(sort_keys, sort_vals);
+    WarpSortT(warp_sort_temp[warp_id_in_block]).Sort(sort_keys, sort_vals, std::less<float>());
 
     // 4. Write globally smallest k elements back to per-warp best arrays in shared memory.
     for (int i = 0; i < MAX_ITEMS_PER_THREAD; ++i) {

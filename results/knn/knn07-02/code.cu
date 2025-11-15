@@ -335,7 +335,9 @@ void run_knn(const float2* query, int query_count,
     cudaGetDevice(&device);
     int max_optin_smem = 0;
     cudaDeviceGetAttribute(&max_optin_smem,
-                           cudaDevAttrMaxDynamicSharedMemoryPerBlockOptin,
+                           /// @FIXED
+                           /// cudaDevAttrMaxDynamicSharedMemoryPerBlockOptin,
+                           cudaDevAttrMaxSharedMemoryPerBlockOptin,
                            device);
     int smem_int = static_cast<int>(smem_per_block);
     if (smem_int > max_optin_smem) {
