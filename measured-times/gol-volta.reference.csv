@@ -1,9 +1,9 @@
 experiment_id;time;std;compiled;verified;runtime_err;extra
-baseline/gol;978.8164999999999;0.7234834137698002;True;True;;
-naive-bitwise/gol;189.79350000000002;0.028050846689536287;True;True;;
-popc-bitwise-macro/gol;95.94142000000001;0.008455034003478403;True;True;;
-popc-bitwise/gol;135.0813;0.011305308487605858;True;True;;
-sota-adder/gol;19.418639999999996;0.015079535801874136;True;True;;
-tiled-bitwise-macro/gol;57.29529;0.0022214634815809074;True;True;;
-dumb-bit-per-thr/gol;820.7942999999999;0.10422384564004857;True;True;;
-smarter-bit-per-thr/gol;837.9540000000001;0.0148121571690151;True;True;;
+baseline/gol;977.868;0.1868325453447581;True;True;;
+naive-bitwise/gol;189.72859999999997;0.033544597180470634;True;True;;
+popc-bitwise-macro/gol;95.98137;0.009541493593771735;True;True;;
+popc-bitwise/gol;136.6415;3.3399099164498423;True;True;;
+sota-adder/gol;19.42079;0.012128103726469669;True;True;;
+tiled-bitwise-macro/gol;57.44794999999999;0.0036924923832008525;True;True;;
+dumb-bit-per-thr/gol;820.8024000000001;0.011542963224405142;True;True;;
+smarter-bit-per-thr/gol;837.9083999999999;0.011226753760538052;True;True;;
