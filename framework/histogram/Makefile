@@ -1,7 +1,7 @@
 CPP=g++
 STD=-std=c++20
 CFLAGS=-Wall -O3 $(STD)
-NVCCFLAGS=-ccbin $(CPP) $(STD) -gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90
+NVCCFLAGS=-ccbin $(CPP) $(STD) -arch=native  -allow-unsupported-compiler
 INCLUDE=/usr/local/cuda/include ./bpplib
 LDFLAGS=
 LIBS=

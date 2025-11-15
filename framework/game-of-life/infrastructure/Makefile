@@ -3,7 +3,7 @@ NVCC = $(CUDA_PATH)/bin/nvcc
 CXX = g++
 
 CXXFLAGS = -std=c++20 -Wall -Wextra -pedantic -O3
-NVCCFLAGS = -ccbin $(CXX) -gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -std=c++20 -Xcompiler -Wall,-Wextra -O3 -I. --extended-lambda
+NVCCFLAGS = -ccbin $(CXX) -arch=native -std=c++20 -Xcompiler -Wall,-Wextra -O3 -I. --extended-lambda -allow-unsupported-compiler
 LDFLAGS = -lcudart
 
 LIB_DIRS = -L$(CUDA_PATH)/lib64
