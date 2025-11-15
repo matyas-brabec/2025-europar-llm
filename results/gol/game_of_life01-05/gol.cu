@@ -1,180 +1,216 @@
+// Conway's Game of Life - High-performance CUDA implementation.
+//
+// This implementation targets modern NVIDIA data-center GPUs (e.g., A100/H100)
+// and emphasizes global memory efficiency and parallelism.
+//
+// Key optimization ideas:
+// 1. Each thread updates one cell.
+// 2. Each block processes a rectangular tile of the grid.
+// 3. A shared-memory tile with a 1-cell halo on all sides is used to cache
+//    the block's cells and their immediate neighbors, so each cell's state
+//    is read from global memory at most once per generation.
+//    - Without this tiling, each cell would require 9 global loads (itself
+//      + 8 neighbors). With tiling, the amortized loads are near 1 per cell.
+// 4. The grid is guaranteed to be square, with size a power of 2 > 512,
+//    which means it is divisible by our chosen block dimensions. Hence, no
+//    per-thread bounds checks are required for the interior of the grid.
+// 5. Boundary handling: cells outside the grid are treated as dead. The
+//    shared-memory halo is explicitly filled with zeros for out-of-bounds
+//    neighbors.
+//
+// The host function run_game_of_life launches a single kernel to advance the
+// automaton by one generation. It assumes that `input` and `output` are
+// device pointers allocated via cudaMalloc, and that any synchronization is
+// handled by the caller.
+
 #include <cuda_runtime.h>
-#include <stdint.h>
+#include <cstddef>
 
-/*
-High-performance CUDA implementation of one step of Conway's Game of Life.
+// Tunable block dimensions.
+//
+// BLOCK_DIM_X should be a multiple of 32 to give coalesced loads along X
+// within a warp. BLOCK_DIM_Y trades off between occupancy and shared-memory
+// footprint. (32 x 8 = 256 threads per block.)
+constexpr int BLOCK_DIM_X = 32;
+constexpr int BLOCK_DIM_Y = 8;
 
-Key optimization choices:
-- Tiled shared-memory staging with a 1-cell halo on all sides to minimize global memory traffic.
-- Shared memory stores use 32-bit elements (0/1) to avoid bank conflicts that occur with 8-bit elements.
-- Coalesced global loads for the main tile and top/bottom halo rows; only a small number of strided loads for left/right halo columns.
-- Branch-free rule evaluation for alive/dead transitions to reduce warp divergence.
-- 2D block size chosen as 32x16 (512 threads) to align with warp size and provide good occupancy on A100/H100.
-
-Assumptions:
-- Grid is square with dimension N, power of two, >= 512.
-- All out-of-bounds cells are treated as dead (0). Halo loads clamp to zero when outside.
-- Input and output pointers are device pointers allocated by cudaMalloc.
-- Caller handles any necessary synchronization.
-*/
-
-#ifndef GOL_BLOCK_X
-#define GOL_BLOCK_X 32
-#endif
-
-#ifndef GOL_BLOCK_Y
-#define GOL_BLOCK_Y 16
-#endif
-
-// Convert a device bool to 0/1 as uint32_t, force-inlined for performance.
-static __device__ __forceinline__ uint32_t bool_to_u32(bool b) {
-    // Using ternary avoids potential pitfalls of casting bool to integer types in device code.
-    return b ? 1u : 0u;
-}
-
-template<int BLOCK_X, int BLOCK_Y>
+// CUDA kernel that computes one generation of Conway's Game of Life.
+//
+// Parameters:
+//   input  - device pointer to current state grid (bool per cell)
+//   output - device pointer to next state grid (bool per cell)
+//   n      - grid dimension (grid is n x n)
+//
+// The grid is partitioned into tiles of size BLOCK_DIM_Y x BLOCK_DIM_X.
+// For each tile, we load an expanded (BLOCK_DIM_Y+2) x (BLOCK_DIM_X+2)
+// region into shared memory to cover the 1-cell halo of neighbors.
+template <int BX, int BY>
 __global__ void game_of_life_kernel(const bool* __restrict__ input,
                                     bool* __restrict__ output,
-                                    int N)
+                                    int n)
 {
-    // Shared tile with 1-cell halo around the block tile.
-    // Using 32-bit elements avoids shared memory bank conflicts for row-wise neighbor accesses.
-    __shared__ uint32_t tile[(BLOCK_Y + 2) * (BLOCK_X + 2)];
+    // Shared-memory tile:
+    // - Interior [1..BY][1..BX] holds the block's cells.
+    // - Border rows/columns at index 0 and BY+1 / BX+1 hold the halo.
+    __shared__ bool tile[BY + 2][BX + 2];
 
-    const int pitch = BLOCK_X + 2;
-
-    // Local thread coordinates within the block
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
-    // Global coordinates this thread is responsible for
-    const int gx = blockIdx.x * BLOCK_X + tx;
-    const int gy = blockIdx.y * BLOCK_Y + ty;
+    const int gx = blockIdx.x * BX + tx;  // global x coordinate
+    const int gy = blockIdx.y * BY + ty;  // global y coordinate
 
-    // Convenience lambda to compute 1D index into shared tile
-    auto s_index = [pitch](int y, int x) { return y * pitch + x; };
+    // Use 64-bit indexing to be robust for very large grids
+    const std::size_t n64  = static_cast<std::size_t>(n);
+    const std::size_t gx64 = static_cast<std::size_t>(gx);
+    const std::size_t gy64 = static_cast<std::size_t>(gy);
+    const std::size_t idx  = gy64 * n64 + gx64;
 
-    // Load the central tile cell into shared memory at (ty+1, tx+1).
-    uint32_t center = 0u;
-    if (gx < N && gy < N) {
-        center = bool_to_u32(input[gy * N + gx]);
-    }
-    tile[s_index(ty + 1, tx + 1)] = center;
+    // 1. Load the central cell corresponding to this thread into shared memory.
+    tile[ty + 1][tx + 1] = input[idx];
 
-    // Top halo row: threads in the first row of the block load the row above
-    if (ty == 0) {
-        const int gy_top = gy - 1;
-        uint32_t val = 0u;
-        if (gx < N && gy_top >= 0) {
-            val = bool_to_u32(input[gy_top * N + gx]);
-        }
-        tile[s_index(0, tx + 1)] = val;
-    }
+    // 2. Load halo cells. Each halo cell is loaded by exactly one thread.
+    //    Out-of-bounds global coordinates are treated as dead (false).
 
-    // Bottom halo row: threads in the last row of the block load the row below
-    if (ty == BLOCK_Y - 1) {
-        const int gy_bot = gy + 1;
-        uint32_t val = 0u;
-        if (gx < N && gy_bot < N) {
-            val = bool_to_u32(input[gy_bot * N + gx]);
-        }
-        tile[s_index(BLOCK_Y + 1, tx + 1)] = val;
-    }
-
-    // Left halo column: threads in the first column of the block load the column to the left
+    // Left halo for this row: (gx - 1, gy)
     if (tx == 0) {
-        const int gx_left = gx - 1;
-        uint32_t val = 0u;
-        if (gx_left >= 0 && gy < N) {
-            val = bool_to_u32(input[gy * N + gx_left]);
+        bool val = false;
+        if (gx > 0) {
+            val = input[idx - 1];
         }
-        tile[s_index(ty + 1, 0)] = val;
+        tile[ty + 1][0] = val;
     }
 
-    // Right halo column: threads in the last column of the block load the column to the right
-    if (tx == BLOCK_X - 1) {
-        const int gx_right = gx + 1;
-        uint32_t val = 0u;
-        if (gx_right < N && gy < N) {
-            val = bool_to_u32(input[gy * N + gx_right]);
+    // Right halo for this row: (gx + 1, gy)
+    if (tx == BX - 1) {
+        bool val = false;
+        if (gx < n - 1) {
+            val = input[idx + 1];
         }
-        tile[s_index(ty + 1, BLOCK_X + 1)] = val;
+        tile[ty + 1][BX + 1] = val;
     }
 
-    // Four corners of the halo, handled by the four corner threads
+    // Top halo for this column: (gx, gy - 1)
+    if (ty == 0) {
+        bool val = false;
+        if (gy > 0) {
+            val = input[idx - n64];
+        }
+        tile[0][tx + 1] = val;
+    }
+
+    // Bottom halo for this column: (gx, gy + 1)
+    if (ty == BY - 1) {
+        bool val = false;
+        if (gy < n - 1) {
+            val = input[idx + n64];
+        }
+        tile[BY + 1][tx + 1] = val;
+    }
+
+    // Corner halos:
+
+    // Top-left halo: (gx - 1, gy - 1)
     if (tx == 0 && ty == 0) {
-        uint32_t val = 0u;
+        bool val = false;
         if (gx > 0 && gy > 0) {
-            val = bool_to_u32(input[(gy - 1) * N + (gx - 1)]);
+            val = input[idx - n64 - 1];
         }
-        tile[s_index(0, 0)] = val;
-    }
-    if (tx == BLOCK_X - 1 && ty == 0) {
-        uint32_t val = 0u;
-        if (gx + 1 < N && gy > 0) {
-            val = bool_to_u32(input[(gy - 1) * N + (gx + 1)]);
-        }
-        tile[s_index(0, BLOCK_X + 1)] = val;
-    }
-    if (tx == 0 && ty == BLOCK_Y - 1) {
-        uint32_t val = 0u;
-        if (gx > 0 && gy + 1 < N) {
-            val = bool_to_u32(input[(gy + 1) * N + (gx - 1)]);
-        }
-        tile[s_index(BLOCK_Y + 1, 0)] = val;
-    }
-    if (tx == BLOCK_X - 1 && ty == BLOCK_Y - 1) {
-        uint32_t val = 0u;
-        if (gx + 1 < N && gy + 1 < N) {
-            val = bool_to_u32(input[(gy + 1) * N + (gx + 1)]);
-        }
-        tile[s_index(BLOCK_Y + 1, BLOCK_X + 1)] = val;
+        tile[0][0] = val;
     }
 
-    // Ensure the tile (including halo) is fully populated before computing neighbors
+    // Top-right halo: (gx + 1, gy - 1)
+    if (tx == BX - 1 && ty == 0) {
+        bool val = false;
+        if (gx < n - 1 && gy > 0) {
+            val = input[idx - n64 + 1];
+        }
+        tile[0][BX + 1] = val;
+    }
+
+    // Bottom-left halo: (gx - 1, gy + 1)
+    if (tx == 0 && ty == BY - 1) {
+        bool val = false;
+        if (gx > 0 && gy < n - 1) {
+            val = input[idx + n64 - 1];
+        }
+        tile[BY + 1][0] = val;
+    }
+
+    // Bottom-right halo: (gx + 1, gy + 1)
+    if (tx == BX - 1 && ty == BY - 1) {
+        bool val = false;
+        if (gx < n - 1 && gy < n - 1) {
+            val = input[idx + n64 + 1];
+        }
+        tile[BY + 1][BX + 1] = val;
+    }
+
+    // Make sure all shared-memory loads are visible before computing neighbors.
     __syncthreads();
 
-    // Only threads that map to valid grid cells write results
-    if (gx < N && gy < N) {
-        // Shared tile index for the current thread's cell
-        const int si = s_index(ty + 1, tx + 1);
+    // 3. Compute the sum of the 8 neighbors for this cell.
+    //
+    // The current cell is at shared-memory coordinates (ty+1, tx+1).
+    // Its neighbors in shared memory:
+    //   (ty+0, tx+0) (ty+0, tx+1) (ty+0, tx+2)
+    //   (ty+1, tx+0)             (ty+1, tx+2)
+    //   (ty+2, tx+0) (ty+2, tx+1) (ty+2, tx+2)
+    int neighbor_count = 0;
 
-        // Sum the 8 neighbors from shared memory
-        // Using 32-bit adds; tile entries are 0 or 1.
-        uint32_t sum =
-            tile[si - pitch - 1] + tile[si - pitch] + tile[si - pitch + 1] +
-            tile[si - 1]                      +          tile[si + 1] +
-            tile[si + pitch - 1] + tile[si + pitch] + tile[si + pitch + 1];
+    neighbor_count += tile[ty + 0][tx + 0];
+    neighbor_count += tile[ty + 0][tx + 1];
+    neighbor_count += tile[ty + 0][tx + 2];
 
-        // Current state (0 or 1)
-        const uint32_t cur = tile[si];
+    neighbor_count += tile[ty + 1][tx + 0];
+    neighbor_count += tile[ty + 1][tx + 2];
 
-        // Branch-free rule evaluation:
-        // next = (sum == 3) || (cur == 1 && sum == 2)
-        const bool next = (sum == 3u) | ((cur == 1u) & (sum == 2u));
+    neighbor_count += tile[ty + 2][tx + 0];
+    neighbor_count += tile[ty + 2][tx + 1];
+    neighbor_count += tile[ty + 2][tx + 2];
 
-        // Write next state to global memory; coalesced across the x dimension.
-        output[gy * N + gx] = next;
+    const bool alive = tile[ty + 1][tx + 1];
+
+    // 4. Apply Conway's Game of Life rules:
+    //    - Any live cell with 2 or 3 live neighbors survives.
+    //    - Any dead cell with exactly 3 live neighbors becomes a live cell.
+    //    - All other live cells die, all other dead cells stay dead.
+    bool next_state;
+    if (alive) {
+        next_state = (neighbor_count == 2 || neighbor_count == 3);
+    } else {
+        next_state = (neighbor_count == 3);
     }
+
+    // 5. Store the updated state back to global memory.
+    output[idx] = next_state;
 }
 
-// Host API: executes one step of Conway's Game of Life.
-// input  - device pointer to N*N bools (alive=true, dead=false)
-// output - device pointer to N*N bools to receive next state
-// grid_dimensions - N (width/height), power of two, >= 512
+// Host-side function to run one generation of Conway's Game of Life on the GPU.
+//
+// Parameters:
+//   input           - device pointer to current state grid (bool per cell)
+//   output          - device pointer to next state grid (bool per cell)
+//   grid_dimensions - width/height of the square grid (n), a power of 2 > 512
+//
+// Assumptions:
+//   - `input` and `output` are allocated via cudaMalloc with size n*n*sizeof(bool).
+//   - `input` and `output` do not alias.
+//   - The caller is responsible for any needed host-device synchronization.
 void run_game_of_life(const bool* input, bool* output, int grid_dimensions)
 {
-    const int N = grid_dimensions;
+    const int n = grid_dimensions;
 
-    // Block and grid configuration; chosen to match warp size in X and provide high occupancy.
-    constexpr int BX = GOL_BLOCK_X;
-    constexpr int BY = GOL_BLOCK_Y;
+    // Given that `n` is guaranteed to be a power of 2 and greater than 512,
+    // it is divisible by BLOCK_DIM_X (32) and BLOCK_DIM_Y (8). Thus, we can
+    // tile the domain exactly with no partial blocks.
+    const dim3 block_dim(BLOCK_DIM_X, BLOCK_DIM_Y);
+    const dim3 grid_dim(n / BLOCK_DIM_X, n / BLOCK_DIM_Y);
 
-    dim3 block(BX, BY, 1);
-    dim3 grid((N + BX - 1) / BX, (N + BY - 1) / BY, 1);
+    // Launch the templated kernel specialized to our chosen block dimensions.
+    game_of_life_kernel<BLOCK_DIM_X, BLOCK_DIM_Y><<<grid_dim, block_dim>>>(input, output, n);
 
-    // Launch the kernel. Caller is responsible for any synchronization.
-    game_of_life_kernel<BX, BY><<<grid, block>>>(input, output, N);
+    // No synchronization here; the caller is responsible for it.
 }
 
 // The content below was not generated by GPT; it was added to ensure the framework can compile the code.

@@ -1,197 +1,289 @@
 #include <cuda_runtime.h>
 #include <utility>
 
-// This implementation assigns one CUDA block per query point.
-// Each block scans all data points and maintains a top-K set using a shared-memory max-heap.
-// Threads cooperatively initialize the heap with the first K distances, then stream through
-// the remaining data, attempting to insert a candidate into the heap only if it beats
-// the current worst (root of the heap). Concurrency on heap updates is controlled via
-// a lightweight shared-memory spinlock. This approach is scalable for large data_count,
-// and efficient because only O(K) successful heap updates are expected per query.
+// This implementation assigns one GPU thread to each query point.
+// Each thread scans all data points and maintains a per-thread fixed-size
+// max-heap of size K containing the K nearest neighbors found so far.
 //
-// At the end, the heap is heap-sorted in-place (O(K log K)) to produce ascending results,
-// and the indices/distances are written to the output.
+// Rationale:
+//   - The number of queries is on the order of thousands, which provides
+//     enough parallelism (thousands of threads) to keep modern GPUs busy.
+//   - Each thread independently processes its query, avoiding inter-thread
+//     synchronization and shared-memory complexity.
+//   - A max-heap gives O(log K) insertion per candidate, which is important
+//     for large K (up to 1024) and large data_count (millions).
+//   - We compute squared Euclidean distance (no sqrt) to minimize ALU cost.
 //
 // Notes:
-// - Distance is squared Euclidean: (dx*dx + dy*dy)
-// - k is a power of two between 32 and 1024 inclusive, and data_count >= k
-// - Uses dynamic shared memory sized as k*(sizeof(float)+sizeof(int)) bytes
-// - Uses 256 threads per block by default, which provides a good balance on A100/H100
+//   - K is known at compile time via template parameter, enabling the
+//     compiler to optimize loops around heap operations.
+//   - For K=1024, the per-thread heap arrays reside in local memory (backed
+//     by global memory). This is unavoidable because K is large enough that
+//     storing all values in registers or shared memory per thread would
+//     severely limit occupancy. However, the dominating cost remains the
+//     O(query_count * data_count) distance computations and global loads,
+//     so this is an acceptable tradeoff.
+//   - The final result for each query is sorted by increasing distance
+//     (result[i * K + 0] is the nearest neighbor).
 
-#ifndef KNN_THREADS_PER_BLOCK
-#define KNN_THREADS_PER_BLOCK 256
-#endif
+namespace {
 
-// Sift-down operation for a max-heap stored in arrays (distances and corresponding indices).
-// This function assumes the heap property may be violated at 'start' and restores it.
-static __device__ __forceinline__
-void heap_sift_down(float* dists, int* idxs, int start, int heap_size) {
-    int i = start;
-    float valDist = dists[i];
-    int valIdx = idxs[i];
+// Max-heap helper: sift element at index `idx` upward to restore heap property.
+template <int K>
+__device__ __forceinline__
+void heap_sift_up(float* __restrict__ heap_dist,
+                  int*   __restrict__ heap_idx,
+                  int idx)
+{
+    // Max-heap: parent index for current node.
+    while (idx > 0) {
+        int parent = (idx - 1) >> 1;
+        if (heap_dist[parent] >= heap_dist[idx])
+            break;
+        // Swap parent and current.
+        float tmpd = heap_dist[parent];
+        heap_dist[parent] = heap_dist[idx];
+        heap_dist[idx] = tmpd;
 
+        int tmpi = heap_idx[parent];
+        heap_idx[parent] = heap_idx[idx];
+        heap_idx[idx] = tmpi;
+
+        idx = parent;
+    }
+}
+
+// Max-heap helper: sift element at index `idx` downward to restore heap property.
+template <int K>
+__device__ __forceinline__
+void heap_sift_down(float* __restrict__ heap_dist,
+                    int*   __restrict__ heap_idx,
+                    int    heap_size,
+                    int    idx)
+{
     while (true) {
-        int left = (i << 1) + 1; // 2*i + 1
-        if (left >= heap_size) break;
+        int left  = (idx << 1) + 1;
         int right = left + 1;
+        int largest = idx;
 
-        // Select the larger child (by distance) for max-heap
-        int larger = left;
-        float largerDist = dists[left];
-        if (right < heap_size) {
-            float rightDist = dists[right];
-            if (rightDist > largerDist) {
-                larger = right;
-                largerDist = rightDist;
-            }
+        if (left < heap_size && heap_dist[left] > heap_dist[largest]) {
+            largest = left;
         }
-
-        if (valDist >= largerDist) {
+        if (right < heap_size && heap_dist[right] > heap_dist[largest]) {
+            largest = right;
+        }
+        if (largest == idx) {
             break;
         }
 
-        // Move child up
-        dists[i] = largerDist;
-        idxs[i] = idxs[larger];
-        i = larger;
-    }
+        // Swap current and largest child.
+        float tmpd = heap_dist[largest];
+        heap_dist[largest] = heap_dist[idx];
+        heap_dist[idx] = tmpd;
 
-    dists[i] = valDist;
-    idxs[i] = valIdx;
-}
+        int tmpi = heap_idx[largest];
+        heap_idx[largest] = heap_idx[idx];
+        heap_idx[idx] = tmpi;
 
-// Bottom-up heap construction (Floyd's algorithm) for a max-heap.
-static __device__ __forceinline__
-void heap_build(float* dists, int* idxs, int heap_size) {
-    for (int i = (heap_size >> 1) - 1; i >= 0; --i) {
-        heap_sift_down(dists, idxs, i, heap_size);
+        idx = largest;
     }
 }
 
-// In-place heap sort on a max-heap to produce ascending order (smallest distance first).
-static __device__ __forceinline__
-void heap_heapsort(float* dists, int* idxs, int heap_size) {
-    for (int n = heap_size; n > 1; --n) {
-        // Swap root (current max) with last element
-        float tmpD = dists[0];
-        int tmpI = idxs[0];
-        dists[0] = dists[n - 1];
-        idxs[0] = idxs[n - 1];
-        dists[n - 1] = tmpD;
-        idxs[n - 1] = tmpI;
-
-        // Restore heap property on the reduced heap [0, n-2]
-        heap_sift_down(dists, idxs, 0, n - 1);
-    }
-}
-
-// Kernel: each block handles one query point.
-__global__ void knn2d_block_streaming_kernel(
-    const float2* __restrict__ query,
-    int query_count,
-    const float2* __restrict__ data,
-    int data_count,
-    std::pair<int, float>* __restrict__ result,
-    int k)
+// Max-heap helper: insert a new (distance, index) into the heap.
+// If heap is not full, grows the heap. If full, replaces the root if the
+// new distance is smaller than the current maximum.
+template <int K>
+__device__ __forceinline__
+void heap_insert(float d,
+                 int   idx_val,
+                 float* __restrict__ heap_dist,
+                 int*   __restrict__ heap_idx,
+                 int&   heap_size)
 {
-    int qid = blockIdx.x;
-    if (qid >= query_count) return;
+    if (heap_size < K) {
+        // Insert at end and sift up.
+        int pos = heap_size;
+        heap_dist[pos] = d;
+        heap_idx[pos]  = idx_val;
+        heap_sift_up<K>(heap_dist, heap_idx, pos);
+        ++heap_size;
+    } else {
+        // Heap is full: only insert if new distance is smaller than current max.
+        if (d < heap_dist[0]) {
+            heap_dist[0] = d;
+            heap_idx[0]  = idx_val;
+            heap_sift_down<K>(heap_dist, heap_idx, heap_size, 0);
+        }
+    }
+}
+
+// Pop the maximum element from the heap (root) and shrink heap_size by 1.
+// Returns (distance, index) through references.
+template <int K>
+__device__ __forceinline__
+void heap_pop_max(float* __restrict__ heap_dist,
+                  int*   __restrict__ heap_idx,
+                  int&   heap_size,
+                  float& out_dist,
+                  int&   out_idx)
+{
+    out_dist = heap_dist[0];
+    out_idx  = heap_idx[0];
+
+    int last = heap_size - 1;
+    heap_dist[0] = heap_dist[last];
+    heap_idx[0]  = heap_idx[last];
+    --heap_size;
+
+    if (heap_size > 0) {
+        heap_sift_down<K>(heap_dist, heap_idx, heap_size, 0);
+    }
+}
+
+// Kernel: one thread per query. Each thread builds a max-heap of size K
+// containing the K nearest neighbors for its query.
+template <int K>
+__global__
+void knn_kernel(const float2* __restrict__ query,
+                int                     query_count,
+                const float2* __restrict__ data,
+                int                     data_count,
+                std::pair<int, float>* __restrict__ result)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= query_count) {
+        return;
+    }
 
     // Load query point into registers.
-    float2 q = query[qid];
+    float2 q = query[tid];
     float qx = q.x;
     float qy = q.y;
 
-    // Dynamic shared memory layout:
-    // [0 .. k-1]: float distances (heap)
-    // [k .. 2k-1]: int indices (heap)
-    extern __shared__ unsigned char smem[];
-    float* sDists = reinterpret_cast<float*>(smem);
-    int* sIdx = reinterpret_cast<int*>(sDists + k);
+    // Per-thread max-heap for top-K nearest neighbors.
+    // For large K these arrays reside in local memory (backed by global),
+    // which is acceptable given that distance computations dominate runtime.
+    float heap_dist[K];
+    int   heap_idx[K];
+    int   heap_size = 0;
 
-    // Shared lock to serialize heap updates.
-    __shared__ int heapLock;
-    if (threadIdx.x == 0) {
-        heapLock = 0;
+    // Scan all data points.
+    for (int j = 0; j < data_count; ++j) {
+        float2 p = data[j];
+        float dx = qx - p.x;
+        float dy = qy - p.y;
+        float d2 = dx * dx + dy * dy;  // squared Euclidean distance
+
+        heap_insert<K>(d2, j, heap_dist, heap_idx, heap_size);
     }
-    __syncthreads();
 
-    // Phase 1: Parallel initialization - compute distances for the first k data points.
-    // Assumption: data_count >= k
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        float2 dp = data[i];
-        float dx = dp.x - qx;
-        float dy = dp.y - qy;
-        sDists[i] = dx * dx + dy * dy;
-        sIdx[i] = i;
-    }
-    __syncthreads();
+    // At this point, heap_size == K (because data_count >= K).
+    // We now extract elements from the max-heap into the result array
+    // in ascending order of distance:
+    //   - Popping from a max-heap gives elements in descending order.
+    //   - We fill the output from the end to the beginning so that
+    //     result[0] is the nearest (smallest distance).
+    int base = tid * K;
+    for (int out_pos = heap_size - 1; out_pos >= 0; --out_pos) {
+        float d;
+        int   idx_val;
+        heap_pop_max<K>(heap_dist, heap_idx, heap_size, d, idx_val);
 
-    // Build a max-heap of size k in shared memory (single thread; O(k)).
-    if (threadIdx.x == 0) {
-        heap_build(sDists, sIdx, k);
-    }
-    __syncthreads();
-
-    // Phase 2: Stream through remaining data and attempt to insert better candidates.
-    // Each thread processes indices in a strided fashion for coalesced global loads.
-    for (int i = threadIdx.x + k; i < data_count; i += blockDim.x) {
-        float2 dp = data[i];
-        float dx = dp.x - qx;
-        float dy = dp.y - qy;
-        float dist = dx * dx + dy * dy;
-
-        // Fast-path rejection using current heap root (worst among top-k).
-        // Reading sDists[0] is a broadcast from shared memory.
-        if (dist < sDists[0]) {
-            // Try to acquire lock and insert if still better than current root.
-            // This while loop spins only when a candidate is competitive and the lock is busy.
-            while (true) {
-                // Re-check before attempting lock to avoid unnecessary contention.
-                if (dist >= sDists[0]) break;
-                if (atomicCAS(&heapLock, 0, 1) == 0) {
-                    // Inside critical section; validate condition again.
-                    if (dist < sDists[0]) {
-                        sDists[0] = dist;
-                        sIdx[0] = i;
-                        heap_sift_down(sDists, sIdx, 0, k);
-                    }
-                    __threadfence_block(); // Ensure shared updates are visible within the block
-                    atomicExch(&heapLock, 0);
-                    break;
-                }
-            }
-        }
-    }
-    __syncthreads();
-
-    // Phase 3: Sort the heap to ascending order for output (single thread; O(k log k)).
-    if (threadIdx.x == 0) {
-        heap_heapsort(sDists, sIdx, k);
-    }
-    __syncthreads();
-
-    // Phase 4: Write results to global memory. For query qid, results occupy [qid*k .. qid*k + k - 1].
-    int out_base = qid * k;
-    for (int j = threadIdx.x; j < k; j += blockDim.x) {
-        // Write index and distance to std::pair fields.
-        result[out_base + j].first = sIdx[j];
-        result[out_base + j].second = sDists[j];
+        std::pair<int, float>& r = result[base + out_pos];
+        r.first  = idx_val;
+        r.second = d;
     }
 }
 
-// Host function to launch the kernel.
-void run_knn(const float2 *query, int query_count, const float2 *data, int data_count, std::pair<int, float> *result, int k) {
-    // Choose launch configuration.
-    const int threads = KNN_THREADS_PER_BLOCK;
-    const int blocks = query_count;
+} // anonymous namespace
 
-    // Dynamic shared memory size: k floats + k ints
-    size_t shared_bytes = static_cast<size_t>(k) * (sizeof(float) + sizeof(int));
+// Host-side launcher.
+// query   : device pointer to array of query_count float2 points.
+// data    : device pointer to array of data_count float2 points.
+// result  : device pointer to array of query_count * k std::pair<int,float>.
+// k       : power of two between 32 and 1024 inclusive.
+//
+// The function launches a CUDA kernel specialized for the given k.
+// No additional device memory is allocated here; all buffers are
+// expected to be allocated by the caller using cudaMalloc.
+void run_knn(const float2* query,
+             int           query_count,
+             const float2* data,
+             int           data_count,
+             std::pair<int, float>* result,
+             int           k)
+{
+    if (query_count <= 0 || data_count <= 0 || k <= 0) {
+        return;
+    }
 
-    // Launch the kernel: one block per query.
-    knn2d_block_streaming_kernel<<<blocks, threads, shared_bytes>>>(query, query_count, data, data_count, result, k);
+    // Tune threads per block for modern NVIDIA GPUs.
+    // 256 threads per block is a reasonable default balancing occupancy
+    // and per-thread resource usage.
+    const int block_size = 256;
+    int grid_size = (query_count + block_size - 1) / block_size;
 
-    // Ensure completion before returning (so that results are ready).
-    cudaDeviceSynchronize();
+    switch (k) {
+        case 32:
+            knn_kernel<32><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+            break;
+        case 64:
+            knn_kernel<64><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+            break;
+        case 128:
+            knn_kernel<128><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+            break;
+        case 256:
+            knn_kernel<256><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+            break;
+        case 512:
+            knn_kernel<512><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+            break;
+        case 1024:
+            knn_kernel<1024><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+            break;
+        default:
+            // According to the problem statement, k is always a power of two
+            // between 32 and 1024 inclusive, so we should never get here.
+            // If we do, fall back to the nearest larger supported K by
+            // clamping to [32, 1024] and rounding up to power of two.
+            {
+                int kk = k;
+                if (kk < 32) kk = 32;
+                if (kk > 1024) kk = 1024;
+
+                // Round up to next power of two within [32, 1024].
+                int pow2 = 32;
+                while (pow2 < kk && pow2 < 1024) {
+                    pow2 <<= 1;
+                }
+
+                switch (pow2) {
+                    case 32:
+                        knn_kernel<32><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+                        break;
+                    case 64:
+                        knn_kernel<64><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+                        break;
+                    case 128:
+                        knn_kernel<128><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+                        break;
+                    case 256:
+                        knn_kernel<256><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+                        break;
+                    case 512:
+                        knn_kernel<512><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+                        break;
+                    case 1024:
+                    default:
+                        knn_kernel<1024><<<grid_size, block_size>>>(query, query_count, data, data_count, result);
+                        break;
+                }
+            }
+            break;
+    }
+
+    // The caller can choose whether to synchronize and check for errors.
+    // cudaDeviceSynchronize() and error handling are intentionally omitted
+    // to keep this function as a pure launcher.
 }

@@ -1,133 +1,172 @@
 #include <cuda_runtime.h>
-#include <stdint.h>
 
 /*
-  CUDA histogram for a restricted character range [from..to].
+ * CUDA histogram kernel optimized for modern NVIDIA GPUs (e.g., A100/H100).
+ *
+ * - Computes a histogram for characters in the inclusive range [from, to].
+ * - Input:  device pointer to chars (`input`), length `inputSize`.
+ * - Output: device pointer to unsigned int histogram (`histogram`) of size (to - from + 1).
+ *
+ * Performance design:
+ * - Per-block histogram privatization in shared memory.
+ *   * To reduce contention further, each warp in a block gets its own private histogram.
+ *   * At the end of the kernel, per-warp histograms are reduced to global memory.
+ * - Global memory reads use a classic grid-stride loop, which results in coalesced accesses.
+ * - The `itemsPerThread` constant controls how many input elements each thread
+ *   is expected to process on average via the grid configuration in `run_histogram`.
+ *
+ * Assumptions:
+ * - `0 <= from <= to <= 255` and the histogram size is (to - from + 1) <= 256.
+ * - `input` and `histogram` are valid device pointers allocated with `cudaMalloc`.
+ * - The caller handles any host-device synchronization after `run_histogram`.
+ */
 
-  Design:
-  - Each thread processes a fixed number of input items (itemsPerThread) to amortize scheduling overhead and improve memory throughput.
-  - Each block maintains a privatized histogram in shared memory, further split per-warp to reduce contention.
-  - Shared histograms are padded to mitigate bank conflicts: index mapping uses i + (i >> 5) with 32-bin periodic padding.
-  - After counting, per-warp histograms are reduced within the block, and only rangeLen atomic updates per block are issued to the global histogram.
-  - The output histogram holds exactly (to - from + 1) bins for ordinals [from..to].
+static constexpr int WARP_SIZE        = 32;
+static constexpr int THREADS_PER_BLOCK = 256;
 
-  Notes:
-  - The input is an array of chars (signedness of char is implementation-defined), so we cast to unsigned char to interpret as [0..255].
-  - The caller is responsible for synchronization; this function launches asynchronous work on the default stream.
-  - The histogram buffer is zeroed here before the kernel launch to produce fresh results.
-*/
+/*
+ * itemsPerThread:
+ *   Controls how many input characters each thread **on average** processes.
+ *   This is enforced by selecting the grid size in `run_histogram` such that:
+ *
+ *     totalThreads ≈ inputSize / itemsPerThread
+ *
+ *   For large inputs on modern GPUs, a value of 8 provides a good balance between
+ *   parallelism, memory latency hiding, and kernel launch overhead.
+ */
+static constexpr int itemsPerThread   = 8;
 
-// Tunables for modern NVIDIA data-center GPUs (e.g., A100/H100).
-// itemsPerThread is chosen to balance memory throughput and occupancy for large inputs.
-static constexpr int BLOCK_SIZE = 256;
-static constexpr int itemsPerThread = 16;
+static_assert(THREADS_PER_BLOCK % WARP_SIZE == 0,
+              "THREADS_PER_BLOCK must be a multiple of WARP_SIZE");
 
-// CUDA kernel implementing the range-restricted histogram with shared-memory privatization.
-__global__ void histogram_range_kernel(const char* __restrict__ input,
-                                       unsigned int* __restrict__ outHist,
-                                       unsigned int inputSize,
-                                       int from, int to)
+__global__ void histogramKernel(const char * __restrict__ input,
+                                unsigned int * __restrict__ histogram,
+                                unsigned int inputSize,
+                                int from,
+                                int to)
 {
-    // Validate assumptions in comments; inputs are assumed valid per problem statement:
-    // 0 <= from < to <= 255, outHist has (to - from + 1) bins.
+    extern __shared__ unsigned int s_hist[];
 
-    const int rangeLen = to - from + 1;
-    // Shared-memory padding to avoid bank conflicts: allocate ceil(rangeLen/32) extra slots
-    // and map logical bin i to physical i + (i >> 5).
-    const int pad = (rangeLen + 31) >> 5;
-    const int paddedLen = rangeLen + pad;
-
-    extern __shared__ unsigned int sHist[]; // Layout: warpsPerBlock consecutive sub-histograms, each of length paddedLen.
-
+    const int range = to - from + 1;             // Number of bins in the histogram.
     const int tid   = threadIdx.x;
-    const int bdim  = blockDim.x;
-    const int bid   = blockIdx.x;
+    const int warpId = tid / WARP_SIZE;          // Warp index within the block.
+    const int warpsPerBlock = blockDim.x / WARP_SIZE;
 
-    const int warpsPerBlock = bdim >> 5;
-    const int warpId        = tid >> 5;   // warp index within the block
-    const int laneId        = tid & 31;   // lane index within the warp
-
-    // Pointer to this warp's private histogram in shared memory.
-    unsigned int* warpHist = sHist + warpId * paddedLen;
-
-    // Zero initialize the entire shared histogram (all warps' sub-histograms).
-    for (int i = tid; i < paddedLen * warpsPerBlock; i += bdim) {
-        sHist[i] = 0u;
+    // -------------------------------------------------------------------------
+    // Initialize per-warp histograms in shared memory.
+    // Layout: s_hist[w * range + bin], w in [0, warpsPerBlock), bin in [0, range).
+    // -------------------------------------------------------------------------
+    for (int i = tid; i < range * warpsPerBlock; i += blockDim.x) {
+        s_hist[i] = 0;
     }
     __syncthreads();
 
-    // Each block processes a contiguous chunk of the input.
-    const size_t blockStart = static_cast<size_t>(bid) * static_cast<size_t>(bdim) * static_cast<size_t>(itemsPerThread);
+    // -------------------------------------------------------------------------
+    // Each thread processes multiple input characters using a grid-stride loop:
+    //   globalId = blockIdx.x * blockDim.x + threadIdx.x
+    //   for (idx = globalId; idx < inputSize; idx += totalThreads) { ... }
+    //
+    // The grid size in `run_histogram` is chosen so that each thread processes
+    // approximately `itemsPerThread` characters on average.
+    // -------------------------------------------------------------------------
+    const unsigned int globalId     = blockIdx.x * blockDim.x + tid;
+    const unsigned int totalThreads = gridDim.x  * blockDim.x;
 
-    // Process itemsPerThread items per thread, spaced by blockDim to ensure fully coalesced loads per iteration.
-    #pragma unroll
-    for (int j = 0; j < itemsPerThread; ++j) {
-        const size_t idx = blockStart + static_cast<size_t>(j) * static_cast<size_t>(bdim) + static_cast<size_t>(tid);
-        if (idx < static_cast<size_t>(inputSize)) {
-            // Read using read-only cache path on capable architectures for better caching behavior.
-            const unsigned char v = static_cast<unsigned char>(__ldg(input + idx));
-            // If the character falls within [from..to], update the corresponding bin in this warp's sub-histogram.
-            if (v >= from && v <= to) {
-                const int bin = static_cast<int>(v) - from;
-                const int pbin = bin + (bin >> 5); // padded index to reduce bank conflicts
-                atomicAdd(&warpHist[pbin], 1u);
-            }
+    for (unsigned int idx = globalId; idx < inputSize; idx += totalThreads) {
+        unsigned char c = static_cast<unsigned char>(input[idx]);
+        int cVal = static_cast<int>(c);
+
+        if (cVal >= from && cVal <= to) {
+            int bin = cVal - from;
+            // Update this warp's private histogram.
+            atomicAdd(&s_hist[warpId * range + bin], 1u);
         }
     }
 
     __syncthreads();
 
-    // Reduce all warp-local histograms into a single set of totals and merge into global memory.
-    // Each thread handles multiple bins in a strided fashion to parallelize the reduction.
-    for (int bin = tid; bin < rangeLen; bin += bdim) {
-        unsigned int total = 0;
-        const int pbin = bin + (bin >> 5);
-        // Accumulate contributions across all warps for this bin.
+    // -------------------------------------------------------------------------
+    // Reduce per-warp histograms into the global histogram.
+    // Each block contributes its bins via atomicAdd to global memory.
+    // -------------------------------------------------------------------------
+    for (int bin = tid; bin < range; bin += blockDim.x) {
+        unsigned int sum = 0;
+
+        // Accumulate contributions from all warps in this block.
         for (int w = 0; w < warpsPerBlock; ++w) {
-            total += sHist[w * paddedLen + pbin];
+            sum += s_hist[w * range + bin];
         }
-        // Only perform atomicAdd if there is a non-zero contribution.
-        if (total) {
-            atomicAdd(&outHist[bin], total);
+
+        if (sum > 0) {
+            atomicAdd(&histogram[bin], sum);
         }
     }
-    // No need for __syncthreads() here, we are leaving the kernel.
 }
 
-// Host-side launcher.
-// Assumptions:
-// - 'input' and 'histogram' are device pointers allocated with cudaMalloc.
-// - 'histogram' has space for exactly (to - from + 1) unsigned ints.
-// - The caller performs any required device synchronization after this call.
-void run_histogram(const char *input, unsigned int *histogram, unsigned int inputSize, int from, int to)
+/*
+ * Host function to run the histogram kernel.
+ *
+ * Parameters:
+ *   input      - device pointer to input text buffer (chars).
+ *   histogram  - device pointer to histogram buffer (unsigned int),
+ *                must have at least (to - from + 1) elements.
+ *   inputSize  - number of chars in the input buffer.
+ *   from, to   - inclusive range of character codes [from, to] to be counted.
+ *
+ * Notes:
+ *   - The function zeroes the output histogram on the device.
+ *   - No host synchronization is performed; the caller must synchronize if needed.
+ */
+void run_histogram(const char *input,
+                   unsigned int *histogram,
+                   unsigned int inputSize,
+                   int from,
+                   int to)
 {
-    if (input == nullptr || histogram == nullptr) return;
-    if (to < from) return;
+    const int range = to - from + 1;
 
-    const int rangeLen = to - from + 1;
+    // Initialize the histogram to zero on the device.
+    // This ensures the kernel can safely accumulate with atomicAdd.
+    cudaMemset(histogram, 0, static_cast<size_t>(range) * sizeof(unsigned int));
 
-    // Zero the output histogram so we can use atomicAdd in the kernel safely.
-    // This is asynchronous with respect to the host; caller should synchronize if needed.
-    cudaMemset(histogram, 0, static_cast<size_t>(rangeLen) * sizeof(unsigned int));
+    // If there's no input, we're done after zeroing the histogram.
+    if (inputSize == 0) {
+        return;
+    }
 
-    // Determine launch configuration.
-    const unsigned long long elemsPerBlock = static_cast<unsigned long long>(BLOCK_SIZE) * static_cast<unsigned long long>(itemsPerThread);
-    if (inputSize == 0 || elemsPerBlock == 0ull) return;
+    const int threadsPerBlock = THREADS_PER_BLOCK;
+    const int warpsPerBlock   = threadsPerBlock / WARP_SIZE;
 
-    // Compute number of blocks to cover the input; round up.
-    const unsigned long long grid64 = (static_cast<unsigned long long>(inputSize) + elemsPerBlock - 1ull) / elemsPerBlock;
-    const int grid = static_cast<int>(grid64);
+    // Determine how many threads and blocks to launch.
+    //
+    // We want approximately `itemsPerThread` input elements per thread:
+    //   totalThreadsNeeded ≈ inputSize / itemsPerThread
+    //   blocks = ceil(totalThreadsNeeded / threadsPerBlock)
+    //
+    // The block count is clamped to the maximum grid dimension in X (65535).
+    unsigned long long totalThreadsNeeded =
+        (static_cast<unsigned long long>(inputSize) + itemsPerThread - 1ULL) /
+        static_cast<unsigned long long>(itemsPerThread);
 
-    if (grid <= 0) return;
+    unsigned long long blocksULL =
+        (totalThreadsNeeded + static_cast<unsigned long long>(threadsPerBlock) - 1ULL) /
+        static_cast<unsigned long long>(threadsPerBlock);
 
-    // Dynamic shared memory size: padded bins per warp times number of warps.
-    const int pad = (rangeLen + 31) / 32;
-    const int paddedLen = rangeLen + pad;
-    const int warpsPerBlock = BLOCK_SIZE / 32;
-    const size_t shmemBytes = static_cast<size_t>(paddedLen) * static_cast<size_t>(warpsPerBlock) * sizeof(unsigned int);
+    if (blocksULL == 0ULL) {
+        blocksULL = 1ULL;
+    }
+    if (blocksULL > 65535ULL) {
+        blocksULL = 65535ULL;
+    }
+    const int blocks = static_cast<int>(blocksULL);
 
-    // Launch kernel on the default stream.
-    histogram_range_kernel<<<grid, BLOCK_SIZE, shmemBytes>>>(input, histogram, inputSize, from, to);
+    // Shared memory size: one histogram per warp in the block.
+    const size_t sharedMemSize =
+        static_cast<size_t>(range) *
+        static_cast<size_t>(warpsPerBlock) *
+        sizeof(unsigned int);
 
-    // No synchronization here; caller handles it.
+    // Launch the kernel.
+    histogramKernel<<<blocks, threadsPerBlock, sharedMemSize>>>(
+        input, histogram, inputSize, from, to);
 }

@@ -1,275 +1,389 @@
 #include <cuda_runtime.h>
+#include <float.h>
 #include <utility>
 
-// This implementation assigns one warp (32 threads) to each query. The block cooperatively loads
-// tiles of the data points into shared memory, and each warp computes distances from its assigned
-// query to the cached points. Each warp keeps an intermediate top-k (k is a power of two and
-// multiple of 32; each lane owns k/32 slots). Updates to the intermediate result from 32 candidates
-// are performed cooperatively using warp shuffles. At the end, each warp writes its k results into
-// shared memory and performs an in-warp bitonic sort (ascending by distance) to produce the final
-// k-NN list per query, which is then written to the output array.
+// -----------------------------------------------------------------------------
+// CUDA k-NN for 2D points (float2) using one warp per query.
 //
-// Design highlights:
-// - One warp per query for predictable control flow and warp-level communication.
-// - Block-wide shared memory tiling of the data for cache reuse, with a tile size chosen to balance
-//   shared memory usage between the tile and the final per-warp sorting scratch buffer.
-// - Incremental top-k maintenance using a distributed replacement of the current global maximum
-//   among the k kept candidates, processing up to 32 candidates per iteration.
-// - Final ordering guaranteed by a single in-warp bitonic sort over the k intermediate results.
-// - No additional global memory allocations; only shared memory is used.
+// Each query is processed by a single warp (32 threads).
+// - The data points are processed in tiles cached in shared memory.
+// - The warp maintains a max-heap of size k containing the k smallest
+//   distances seen so far (squared Euclidean distances).
+// - The heap is distributed across threads in the warp in a lane-strided
+//   fashion to keep everything in registers.
+// - Warp shuffles are used to read/modify heap entries that reside in
+//   different lanes.
+// - Initial k candidates are collected unsorted, then a bottom-up heap build
+//   is performed. Remaining candidates are inserted using heap updates.
+// - After all data is processed, an in-place heapsort generates sorted
+//   neighbors (ascending distance), then results are written to global memory.
+//
+// Assumptions:
+// - k is a power of two between 32 and 1024 inclusive (so k is a multiple of 32).
+// - data_count >= k.
+// - query_count and data_count are large enough to benefit from GPU parallelism.
+// - All pointers passed to run_knn are allocated via cudaMalloc.
+// -----------------------------------------------------------------------------
 
-#ifndef KNN_WARPS_PER_BLOCK
-#define KNN_WARPS_PER_BLOCK 8
-#endif
+// Warp and block configuration.
+static constexpr int WARP_SIZE         = 32;
+static constexpr int WARPS_PER_BLOCK   = 8;      // 8 warps per block => 256 threads.
+static constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_PER_BLOCK;
 
-#ifndef KNN_TILE_SIZE
-#define KNN_TILE_SIZE 4096
-#endif
+// Shared-memory tile size for data points.
+// 4096 * sizeof(float2) = 32 KB per block, which is reasonable on modern GPUs.
+static constexpr int TILE_SIZE = 4096;
 
-// Pair struct used in shared memory scratch for sorting (distance, index).
-struct PairDF {
-    float dist;
-    int   idx;
-};
+// Maximum supported k (as per problem statement).
+static constexpr int MAX_K = 1024;
 
-// Warp-level argmax reduction for (value, lane, pos) triple. Returns the triple broadcast to all lanes.
-__device__ __forceinline__ void warp_argmax(float local_val, int local_pos, int lane_id,
-                                            float &out_val, int &out_lane, int &out_pos, unsigned mask) {
-    float val = local_val;
-    int pos   = local_pos;
-    int ln    = lane_id;
+// Number of heap elements per lane (lane-strided storage).
+// MAX_K is 1024 and WARP_SIZE is 32, so this equals 32.
+static constexpr int MAX_HEAP_ELEMS_PER_LANE = (MAX_K + WARP_SIZE - 1) / WARP_SIZE;
 
-    // Tree reduction by comparing values, breaking ties by lane then position to get deterministic behavior.
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float oth_val = __shfl_down_sync(mask, val, offset);
-        int   oth_ln  = __shfl_down_sync(mask, ln,  offset);
-        int   oth_pos = __shfl_down_sync(mask, pos, offset);
+// Convenience macro for full warp mask.
+static constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
 
-        bool take_other = (oth_val > val) || (oth_val == val && (oth_ln > ln || (oth_ln == ln && oth_pos > pos)));
-        if (take_other) {
-            val = oth_val;
-            ln  = oth_ln;
-            pos = oth_pos;
+
+// -----------------------------------------------------------------------------
+// Heap helper functions (device-side, warp-synchronous).
+//
+// Heap representation:
+//   - Max-heap of up to 'heap_size' elements, indexes [0, heap_size-1].
+//   - Logical index i is mapped to (lane, slot):
+//           lane = i % WARP_SIZE
+//           slot = i / WARP_SIZE
+//   - Each lane owns MAX_HEAP_ELEMS_PER_LANE "slots" in registers:
+//           dist_heap[slot], idx_heap[slot]
+//
+// All helper functions are warp-synchronous: they must be called by all threads
+// in a warp with the same arguments. Communication between lanes uses
+// __shfl_sync, and updates to heap entries are performed by the owning lane.
+// -----------------------------------------------------------------------------
+
+// Bubble-down (heapify-down) from a specific node index 'start_idx' in a
+// max-heap. Runs entirely within one warp.
+__device__ __forceinline__
+void warp_heapify_down(float *dist_heap,
+                       int   *idx_heap,
+                       int    heap_size,
+                       int    start_idx,
+                       int    lane_id)
+{
+    int idx = start_idx;
+
+    while (true) {
+        int left  = idx * 2 + 1;
+        if (left >= heap_size) {
+            // No children; heap property satisfied.
+            break;
         }
+        int right = left + 1;
+
+        // Map node indices to (lane, slot).
+        int lane_idx  = idx   & (WARP_SIZE - 1);
+        int slot_idx  = idx   >> 5; // divide by 32
+        int lane_left = left  & (WARP_SIZE - 1);
+        int slot_left = left  >> 5;
+        int lane_right = 0;
+        int slot_right = 0;
+
+        // Gather parent and left child distances.
+        float dist_idx  = __shfl_sync(FULL_MASK, dist_heap[slot_idx],  lane_idx);
+        float dist_left = __shfl_sync(FULL_MASK, dist_heap[slot_left], lane_left);
+
+        // Gather right child distance if it exists.
+        float dist_right = -FLT_MAX;
+        bool has_right = (right < heap_size);
+        if (has_right) {
+            lane_right = right & (WARP_SIZE - 1);
+            slot_right = right >> 5;
+            dist_right = __shfl_sync(FULL_MASK, dist_heap[slot_right], lane_right);
+        }
+
+        // Lane 0 decides which node (parent/left/right) has the largest distance.
+        int  max_idx   = idx;
+        float max_dist = dist_idx;
+        if (dist_left > max_dist) {
+            max_dist = dist_left;
+            max_idx  = left;
+        }
+        if (has_right && dist_right > max_dist) {
+            max_dist = dist_right;
+            max_idx  = right;
+        }
+
+        // Broadcast max_idx from lane 0 to all lanes.
+        max_idx = __shfl_sync(FULL_MASK, max_idx, 0);
+        if (max_idx == idx) {
+            // Heap property satisfied at this node.
+            break;
+        }
+
+        // Swap node at idx with node at max_idx (their distances and indices).
+        int child_idx   = max_idx;
+        int lane_child  = child_idx & (WARP_SIZE - 1);
+        int slot_child  = child_idx >> 5;
+
+        float dist_node  = __shfl_sync(FULL_MASK, dist_heap[slot_idx],   lane_idx);
+        int   id_node    = __shfl_sync(FULL_MASK, idx_heap[slot_idx],    lane_idx);
+        float dist_child = __shfl_sync(FULL_MASK, dist_heap[slot_child], lane_child);
+        int   id_child   = __shfl_sync(FULL_MASK, idx_heap[slot_child],  lane_child);
+
+        if (lane_id == lane_idx) {
+            dist_heap[slot_idx] = dist_child;
+            idx_heap[slot_idx]  = id_child;
+        }
+        if (lane_id == lane_child) {
+            dist_heap[slot_child] = dist_node;
+            idx_heap[slot_child]  = id_node;
+        }
+
+        idx = child_idx; // Continue bubbling down at child's position.
     }
-    // Broadcast the result from lane 0 to all lanes in the warp.
-    out_val  = __shfl_sync(mask, val, 0);
-    out_lane = __shfl_sync(mask, ln,  0);
-    out_pos  = __shfl_sync(mask, pos, 0);
 }
 
-__global__ void knn_kernel(const float2 * __restrict__ query, int query_count,
-                           const float2 * __restrict__ data,  int data_count,
-                           std::pair<int, float> * __restrict__ result, int k)
+
+// Build a max-heap in-place from arbitrary values in [0, heap_size-1] using
+// bottom-up heap construction.
+__device__ __forceinline__
+void warp_build_max_heap(float *dist_heap,
+                         int   *idx_heap,
+                         int    heap_size,
+                         int    lane_id)
 {
-    // Identify warp and lane.
-    const int lane_id        = threadIdx.x & 31;
-    const int warp_id_in_blk = threadIdx.x >> 5;
-    const int warps_per_blk  = blockDim.x >> 5;
-    const int warp_global_id = blockIdx.x * warps_per_blk + warp_id_in_blk;
+    // Start from the last parent node and heapify downwards.
+    for (int i = (heap_size / 2) - 1; i >= 0; --i) {
+        warp_heapify_down(dist_heap, idx_heap, heap_size, i, lane_id);
+    }
+}
 
-    const bool warp_active = (warp_global_id < query_count);
-    const unsigned full_mask = 0xFFFFFFFFu;
 
-    // Shared memory layout:
-    // [ 0 .. KNN_TILE_SIZE * sizeof(float2) ) => tile of data points (float2)
-    // [ KNN_TILE_SIZE * sizeof(float2) .. )   => per-warp scratch buffers for final sort (k PairDF per warp)
-    extern __shared__ unsigned char smem_raw[];
-    float2 *tile = reinterpret_cast<float2 *>(smem_raw);
-    PairDF *scratch_base = reinterpret_cast<PairDF *>(smem_raw + sizeof(float2) * KNN_TILE_SIZE);
-    PairDF *warp_scratch = scratch_base + warp_id_in_blk * k; // warp-private scratch of length k
+// In-place heap sort on the max-heap, producing ascending order by distance.
+// After this, the logical indices [0, heap_size-1] contain sorted neighbors
+// (smallest distance at index 0).
+__device__ __forceinline__
+void warp_heap_sort_ascending(float *dist_heap,
+                              int   *idx_heap,
+                              int    heap_size,
+                              int    lane_id)
+{
+    // Standard heapsort using a max-heap.
+    for (int end = heap_size - 1; end > 0; --end) {
+        // Swap root (index 0) with element at 'end'.
+        int root_idx = 0;
+        int lane_root = root_idx & (WARP_SIZE - 1);
+        int slot_root = root_idx >> 5;
+        int lane_end  = end      & (WARP_SIZE - 1);
+        int slot_end  = end      >> 5;
 
-    // Each warp is responsible for one query index.
-    int q_idx = warp_global_id;
+        float dist_root = __shfl_sync(FULL_MASK, dist_heap[slot_root], lane_root);
+        int   id_root   = __shfl_sync(FULL_MASK, idx_heap[slot_root],  lane_root);
+        float dist_end  = __shfl_sync(FULL_MASK, dist_heap[slot_end],  lane_end);
+        int   id_end    = __shfl_sync(FULL_MASK, idx_heap[slot_end],   lane_end);
 
-    // Broadcast the query point to all lanes of the warp.
-    float qx = 0.f, qy = 0.f;
-    if (warp_active) {
-        float2 q;
-        if (lane_id == 0) {
-            q = query[q_idx];
+        if (lane_id == lane_root) {
+            dist_heap[slot_root] = dist_end;
+            idx_heap[slot_root]  = id_end;
         }
-        unsigned mask = __activemask();
-        qx = __shfl_sync(mask, q.x, 0);
-        qy = __shfl_sync(mask, q.y, 0);
+        if (lane_id == lane_end) {
+            dist_heap[slot_end] = dist_root;
+            idx_heap[slot_end]  = id_root;
+        }
+
+        // Restore heap property for the reduced heap [0, end-1].
+        warp_heapify_down(dist_heap, idx_heap, end, 0, lane_id);
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// k-NN kernel: one warp per query.
+// -----------------------------------------------------------------------------
+__global__
+void knn_kernel(const float2 * __restrict__ query,
+                int                    query_count,
+                const float2 * __restrict__ data,
+                int                    data_count,
+                std::pair<int, float> * __restrict__ result,
+                int                    k)
+{
+    extern __shared__ float2 shared_data[]; // Shared-memory tile of data points.
+
+    const int thread_id      = threadIdx.x;
+    const int lane_id        = thread_id & (WARP_SIZE - 1);
+    const int warp_id_in_block = thread_id / WARP_SIZE;
+    const int global_warp_id   = blockIdx.x * WARPS_PER_BLOCK + warp_id_in_block;
+
+    const bool warp_active = (global_warp_id < query_count);
+
+    // Each warp corresponds to one query index.
+    const int query_idx = global_warp_id;
+
+    // Per-lane heap storage (distributed heap for this query).
+    float dist_heap[MAX_HEAP_ELEMS_PER_LANE];
+    int   idx_heap [MAX_HEAP_ELEMS_PER_LANE];
+
+    // Early exit for warps without an assigned query: they still must
+    // participate in __syncthreads() but skip all query-dependent work.
+    if (!warp_active) {
+        // Still need to participate in shared memory loads and synchronizations.
+        for (int tile_start = 0; tile_start < data_count; tile_start += TILE_SIZE) {
+            int tile_len = data_count - tile_start;
+            if (tile_len > TILE_SIZE) tile_len = TILE_SIZE;
+
+            // Cooperative load of data tile into shared memory.
+            for (int i = thread_id; i < tile_len; i += blockDim.x) {
+                shared_data[i] = data[tile_start + i];
+            }
+            __syncthreads();
+            __syncthreads();
+        }
+        return;
     }
 
-    // Per-lane local storage for the warp's distributed top-k (each lane holds s = k/32 items).
-    const int s = k >> 5; // since k is a power of two between 32 and 1024, s in [1, 32]
-    float best_dist[32]; // max size; only first s used
-    int   best_idx[32];
-    int   filled_lane = 0;        // number of filled slots in this lane (for prefill phase)
-    bool  has_threshold = false;  // whether the initial K candidates have been collected
+    // Load query point for this warp.
+    float2 q = query[query_idx];
 
-    // Local cached "max" per lane among its s entries (valid only when has_threshold true).
-    float local_max_val = -CUDART_INF_F;
-    int   local_max_pos = 0;
+    // Total number of data points processed so far for this query.
+    int processed = 0;
 
-    // Current global threshold triple (value, lane, pos) for the worst (maximum distance) among the K kept.
-    float thr_val = CUDART_INF_F;
-    int   thr_lane = 0, thr_pos = 0;
+    // Once 'processed == k', heap will be constructed from the first k entries.
+    bool heap_built = false;
 
-    // Process data in tiles loaded into shared memory by the whole thread block.
-    for (int tile_start = 0; tile_start < data_count; tile_start += KNN_TILE_SIZE) {
-        int tile_count = data_count - tile_start;
-        if (tile_count > KNN_TILE_SIZE) tile_count = KNN_TILE_SIZE;
+    // Main loop over data points in tiles.
+    for (int tile_start = 0; tile_start < data_count; tile_start += TILE_SIZE) {
+        int tile_len = data_count - tile_start;
+        if (tile_len > TILE_SIZE) tile_len = TILE_SIZE;
 
-        // All threads in the block cooperatively load the tile into shared memory.
-        for (int i = threadIdx.x; i < tile_count; i += blockDim.x) {
-            tile[i] = data[tile_start + i];
+        // Load this tile of data into shared memory using the whole block.
+        for (int i = thread_id; i < tile_len; i += blockDim.x) {
+            shared_data[i] = data[tile_start + i];
         }
         __syncthreads();
 
-        // Each warp processes the tile against its query.
-        if (warp_active) {
-            // Iterate over the tile in groups of 32 so that each lane handles one candidate at a time.
-            for (int j_base = 0; j_base < tile_count; j_base += 32) {
-                int j = j_base + lane_id;
-                bool valid = (j < tile_count);
+        // Each active warp processes the shared tile against its query.
+        // We process tile entries in groups of WARP_SIZE. In each group,
+        // each lane computes distance for one point, then candidates are
+        // fed into the warp-local heap in a warp-synchronous manner.
+        for (int base = 0; base < tile_len; base += WARP_SIZE) {
+            int idx_in_tile = base + lane_id;
+            bool valid = (idx_in_tile < tile_len);
 
-                float2 p = make_float2(0.f, 0.f);
-                if (valid) p = tile[j];
+            float cand_dist = 0.0f;
+            int   cand_idx  = -1;
 
-                float dx = p.x - qx;
-                float dy = p.y - qy;
-                float dist = fmaf(dy, dy, dx * dx);  // squared L2 distance
-                int   didx = tile_start + j;
+            if (valid) {
+                float2 p = shared_data[idx_in_tile];
+                float dx = p.x - q.x;
+                float dy = p.y - q.y;
+                cand_dist = dx * dx + dy * dy;           // squared Euclidean distance
+                cand_idx  = tile_start + idx_in_tile;    // global index of data point
+            }
 
-                // Prefill phase: keep inserting until each lane has filled 's' items.
-                if (!has_threshold) {
-                    if (valid && (filled_lane < s)) {
-                        best_dist[filled_lane] = dist;
-                        best_idx[filled_lane]  = didx;
-                        ++filled_lane;
-                    }
-                    // After attempting to fill this round, check if the whole warp has completed prefill.
-                    unsigned mask = __activemask();
-                    int lane_full = (filled_lane >= s) ? 1 : 0;
-                    unsigned full_mask_ballot = __ballot_sync(mask, lane_full);
-                    if (full_mask_ballot == full_mask) {
-                        // Compute initial local maxima per lane.
-                        float mval = best_dist[0];
-                        int mpos = 0;
-                        #pragma unroll
-                        for (int t = 1; t < s; ++t) {
-                            float v = best_dist[t];
-                            if (v > mval) { mval = v; mpos = t; }
-                        }
-                        local_max_val = mval;
-                        local_max_pos = mpos;
-                        // Compute global maximum across the warp to set the initial threshold.
-                        warp_argmax(local_max_val, local_max_pos, lane_id, thr_val, thr_lane, thr_pos, mask);
-                        has_threshold = true;
-                    }
-                    // Continue to next 32-candidate batch.
+            // Process the WARP_SIZE candidates in a deterministic order
+            // (lane 0 to lane 31). Each candidate is handled by the whole warp
+            // when updating the heap.
+            #pragma unroll
+            for (int src_lane = 0; src_lane < WARP_SIZE; ++src_lane) {
+                bool src_valid = __shfl_sync(FULL_MASK, valid, src_lane);
+                if (!src_valid) {
                     continue;
                 }
 
-                // After prefill: filter candidates against the current threshold and replace the worst if needed.
-                // Build a mask of candidates that are valid and would improve the current top-k.
-                unsigned mask = __activemask();
-                int accept = (valid && (dist < thr_val)) ? 1 : 0;
-                unsigned accept_mask = __ballot_sync(mask, accept);
+                float dist = __shfl_sync(FULL_MASK, cand_dist, src_lane);
+                int   idx  = __shfl_sync(FULL_MASK, cand_idx,  src_lane);
 
-                // Process the accepted candidates one by one (at most 32 per batch).
-                while (accept_mask) {
-                    // Lane id of the next candidate to insert (lowest set bit).
-                    int src_lane = __ffs(accept_mask) - 1;
+                if (processed < k) {
+                    // Fill initial buffer of k elements (unsorted).
+                    int insert_idx = processed;
+                    int owner_lane = insert_idx & (WARP_SIZE - 1);
+                    int owner_slot = insert_idx >> 5;
 
-                    // Broadcast the candidate from src_lane to all lanes.
-                    float cand_dist = __shfl_sync(mask, dist, src_lane);
-                    int   cand_idx  = __shfl_sync(mask, didx, src_lane);
-
-                    // Replace the current global worst with this candidate.
-                    if (lane_id == thr_lane) {
-                        best_dist[thr_pos] = cand_dist;
-                        best_idx[thr_pos]  = cand_idx;
-                        // Recompute this lane's local maximum.
-                        float mval = best_dist[0];
-                        int mpos = 0;
-                        #pragma unroll
-                        for (int t = 1; t < s; ++t) {
-                            float v = best_dist[t];
-                            if (v > mval) { mval = v; mpos = t; }
-                        }
-                        local_max_val = mval;
-                        local_max_pos = mpos;
+                    if (lane_id == owner_lane) {
+                        dist_heap[owner_slot] = dist;
+                        idx_heap[owner_slot]  = idx;
                     }
 
-                    // Recompute the global threshold after the replacement.
-                    warp_argmax(local_max_val, local_max_pos, lane_id, thr_val, thr_lane, thr_pos, mask);
+                    ++processed;
 
-                    // Clear this candidate from the accept mask and continue.
-                    accept_mask &= ~(1u << src_lane);
-                }
-            } // end for j_base
-        } // end if warp_active
-
-        __syncthreads(); // ensure tile is not accessed before being overwritten by the next tile
-    } // end for tile_start
-
-    // Final sort and writeback of results.
-    if (warp_active) {
-        // Write the warp's k candidates into its reserved shared memory buffer.
-        for (int t = 0; t < s; ++t) {
-            int g = lane_id * s + t;
-            warp_scratch[g].dist = best_dist[t];
-            warp_scratch[g].idx  = best_idx[t];
-        }
-        __syncwarp();
-
-        // In-warp bitonic sort over k elements in shared memory (ascending by distance).
-        // Each thread processes a strided subset of indices to perform compare-exchange on disjoint pairs.
-        for (int size = 2; size <= k; size <<= 1) {
-            for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                for (int i = lane_id; i < k; i += 32) {
-                    int j = i ^ stride;
-                    if (j > i) {
-                        bool ascending = ((i & size) == 0);
-                        PairDF a = warp_scratch[i];
-                        PairDF b = warp_scratch[j];
-                        bool do_swap = ascending ? (a.dist > b.dist) : (a.dist < b.dist);
-                        if (do_swap) {
-                            warp_scratch[i] = b;
-                            warp_scratch[j] = a;
-                        }
+                    // Once we have k elements, build the initial max-heap.
+                    if (processed == k) {
+                        warp_build_max_heap(dist_heap, idx_heap, k, lane_id);
+                        heap_built = true;
                     }
+                } else {
+                    // For remaining elements, use heap insertion:
+                    // replace heap root if the new candidate is closer.
+                    if (!heap_built) {
+                        // Safety: in case processed starts >= k for some reason.
+                        warp_build_max_heap(dist_heap, idx_heap, k, lane_id);
+                        heap_built = true;
+                    }
+
+                    // Broadcast current root distance from lane 0.
+                    float root_dist = __shfl_sync(FULL_MASK, dist_heap[0], 0);
+
+                    if (dist < root_dist) {
+                        // Replace root with the new, closer candidate.
+                        if (lane_id == 0) {
+                            dist_heap[0] = dist;
+                            idx_heap[0]  = idx;
+                        }
+                        // Restore heap property.
+                        warp_heapify_down(dist_heap, idx_heap, k, 0, lane_id);
+                    }
+
+                    ++processed;
                 }
-                __syncwarp();
             }
         }
 
-        // Write the sorted neighbors to the output array for this query.
-        // Output layout: for query q_idx, result[q_idx * k + j] = (index, distance) of the j-th nearest neighbor.
-        for (int j = lane_id; j < k; j += 32) {
-            int out_idx = q_idx * k + j;
-            PairDF p = warp_scratch[j];
-            // std::pair<int,float> is assumed trivially assignable in device code.
-            result[out_idx] = std::pair<int, float>(p.idx, p.dist);
-        }
+        __syncthreads();
+    }
+
+    // After all data points have been processed, dist_heap/idx_heap contain
+    // the k nearest neighbor candidates in a max-heap (largest distance at root).
+    // Convert to ascending order using heap sort.
+    warp_heap_sort_ascending(dist_heap, idx_heap, k, lane_id);
+
+    // Write sorted results to global memory.
+    // Each lane writes its own lane-strided entries.
+    int slots_per_lane = k / WARP_SIZE; // k is a multiple of 32 by assumption.
+    for (int slot = 0; slot < slots_per_lane; ++slot) {
+        int j = lane_id + slot * WARP_SIZE; // logical index in [0, k-1]
+        int out_index = query_idx * k + j;
+
+        result[out_index].first  = idx_heap[slot];
+        result[out_index].second = dist_heap[slot];
     }
 }
 
-// Host entry point. Launches the kernel with chosen hyperparameters and dynamic shared memory size.
-void run_knn(const float2 *query, int query_count, const float2 *data, int data_count,
-             std::pair<int, float> *result, int k)
+
+// -----------------------------------------------------------------------------
+// Host wrapper: launches the k-NN kernel.
+// -----------------------------------------------------------------------------
+void run_knn(const float2 *query,
+             int           query_count,
+             const float2 *data,
+             int           data_count,
+             std::pair<int, float> *result,
+             int           k)
 {
-    // Choose execution configuration.
-    const int warps_per_block = KNN_WARPS_PER_BLOCK;
-    const int threads_per_block = warps_per_block * 32;
-    const int total_warps = (query_count + 0) / 1; // one warp per query
-    const int blocks = (query_count + warps_per_block - 1) / warps_per_block;
+    // Compute grid configuration: one warp per query.
+    int total_warps = (query_count + 0); // 1 warp per query
+    int blocks = (total_warps + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    // Dynamic shared memory size:
-    // - Tile of float2: KNN_TILE_SIZE * sizeof(float2)
-    // - Per-warp scratch for final sort: warps_per_block * k * sizeof(PairDF)
-    size_t shmem_bytes = sizeof(float2) * KNN_TILE_SIZE + sizeof(PairDF) * (size_t)warps_per_block * (size_t)k;
+    dim3 block_dim(THREADS_PER_BLOCK, 1, 1);
+    dim3 grid_dim(blocks, 1, 1);
 
-    // Opt-in to larger dynamic shared memory if needed (on modern GPUs this is supported).
-    cudaFuncSetAttribute(knn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem_bytes);
+    // Shared memory size: TILE_SIZE float2's per block.
+    size_t shared_mem_bytes = static_cast<size_t>(TILE_SIZE) * sizeof(float2);
 
-    // Launch the kernel.
-    dim3 grid(blocks);
-    dim3 block(threads_per_block);
-    knn_kernel<<<grid, block, shmem_bytes>>>(query, query_count, data, data_count, result, k);
+    knn_kernel<<<grid_dim, block_dim, shared_mem_bytes>>>(
+        query, query_count, data, data_count, result, k
+    );
+
+    // Optionally synchronize here to ensure completion before returning.
+    cudaDeviceSynchronize();
 }

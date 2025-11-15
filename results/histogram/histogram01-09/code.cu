@@ -1,116 +1,147 @@
 #include <cuda_runtime.h>
 
-// CUDA kernel for computing the histogram over a specified character range.
-// Strategy:
-//   - Each block builds a private histogram in shared memory to reduce global atomic contention.
-//   - Threads iterate over the input using a grid-stride loop and atomically increment shared bins for characters in [from, to].
-//   - After processing, each block merges its shared histogram into the global histogram via atomicAdd (numBins adds per block).
-// Notes:
-//   - Characters are treated as unsigned to avoid sign-extension issues with char.
-//   - Dynamic shared memory is used with size = (to - from + 1) * sizeof(unsigned int).
-//   - The output histogram must be zero-initialized before the kernel runs; run_histogram handles this.
-//   - The kernel is optimized for modern GPUs (A100/H100) where shared-memory atomics are efficient.
-__global__ void histogram_range_kernel(const unsigned char* __restrict__ input,
-                                       unsigned int* __restrict__ globalHist,
-                                       unsigned int n,
-                                       int from,
-                                       int to)
+/*
+ * CUDA kernel to compute a histogram of character occurrences in a given
+ * continuous range [from, to] on a text buffer stored in device memory.
+ *
+ * The histogram is computed only for characters in that range; characters
+ * outside the range are ignored.
+ *
+ * The kernel uses a per-block shared-memory histogram (up to 256 bins)
+ * to reduce global memory contention. After processing its portion of the
+ * input via a grid-stride loop, each block atomically accumulates its
+ * partial histogram into the global histogram buffer.
+ */
+__global__ void histogram_kernel(const char *__restrict__ input,
+                                 unsigned int *__restrict__ histogram,
+                                 unsigned int inputSize,
+                                 int from,
+                                 int to)
 {
-    extern __shared__ unsigned int s_hist[];
-    const int numBins = to - from + 1;
+    // Maximum possible range is 256 (characters 0..255).
+    __shared__ unsigned int local_hist[256];
 
-    // Initialize shared histogram to zero (cooperatively across threads).
-    for (int i = threadIdx.x; i < numBins; i += blockDim.x) {
-        s_hist[i] = 0u;
+    int range = to - from + 1;
+    if (range <= 0 || range > 256) {
+        // Invalid range: nothing to do.
+        return;
+    }
+
+    // Initialize per-block shared histogram to zero.
+    for (int i = threadIdx.x; i < range; i += blockDim.x) {
+        local_hist[i] = 0u;
     }
     __syncthreads();
 
     // Grid-stride loop over the input.
-    unsigned int idx    = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int stride = blockDim.x * gridDim.x;
+    unsigned int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+    int range_minus_1   = range - 1;
 
-    while (idx < n) {
-        unsigned int c = static_cast<unsigned int>(input[idx]);  // 0..255
-        int bin = static_cast<int>(c) - from;
-        // Use unsigned comparison for range check: 0 <= bin < numBins
-        if (static_cast<unsigned int>(bin) < static_cast<unsigned int>(numBins)) {
-            atomicAdd(&s_hist[bin], 1u);
+    while (tid < inputSize) {
+        // Load character and convert to unsigned to avoid sign issues.
+        int c = static_cast<unsigned char>(input[tid]);
+        // Shift into [0, 255] and then to [-(from), 255-from].
+        c -= from;
+
+        // Single comparison range check:
+        // If 0 <= c <= range_minus_1, then (unsigned)c <= (unsigned)range_minus_1.
+        if (static_cast<unsigned int>(c) <= static_cast<unsigned int>(range_minus_1)) {
+            // Safe to index local_hist[c] since c is in [0, range-1].
+            atomicAdd(&local_hist[c], 1u);
         }
-        idx += stride;
+
+        tid += stride;
     }
+
     __syncthreads();
 
-    // Merge shared histogram into global histogram.
-    for (int i = threadIdx.x; i < numBins; i += blockDim.x) {
-        unsigned int val = s_hist[i];
-        if (val) {
-            atomicAdd(&globalHist[i], val);
+    // Accumulate per-block histogram into global histogram.
+    for (int i = threadIdx.x; i < range; i += blockDim.x) {
+        unsigned int count = local_hist[i];
+        if (count != 0u) {
+            atomicAdd(&histogram[i], count);
         }
     }
 }
 
-// Host function that configures and launches the histogram kernel.
-// Parameters:
-//   - input:      device pointer to input chars (plain text)
-//   - histogram:  device pointer to output histogram (size = to - from + 1)
-//   - inputSize:  number of chars in input
-//   - from, to:   inclusive character range [from, to] (0 <= from <= to <= 255)
-// Behavior:
-//   - Zero-initializes the output histogram.
-//   - Chooses a launch configuration using occupancy to limit the number of blocks,
-//     thus avoiding excessive global merge atomics for very large inputs.
-//   - Launches the kernel with dynamic shared memory sized to the number of bins.
-// Synchronization:
-//   - This function does not synchronize; the caller is responsible for any required synchronization.
-void run_histogram(const char *input, unsigned int *histogram, unsigned int inputSize, int from, int to)
+/*
+ * Host function to set up and launch the histogram CUDA kernel.
+ *
+ * Parameters:
+ *   - input:      device pointer to text buffer (chars).
+ *   - histogram:  device pointer to histogram buffer of size (to - from + 1).
+ *   - inputSize:  number of characters in the input buffer.
+ *   - from, to:   character ordinal range [from, to], 0 <= from <= to <= 255.
+ *
+ * Assumptions:
+ *   - input and histogram pointers are allocated with cudaMalloc.
+ *   - Caller is responsible for any required synchronization (e.g.,
+ *     cudaDeviceSynchronize) and error checking after this function returns.
+ */
+void run_histogram(const char *input,
+                   unsigned int *histogram,
+                   unsigned int inputSize,
+                   int from,
+                   int to)
 {
-    // Validate range; handle degenerate or invalid ranges safely.
-    if (from < 0 || to < 0 || from > 255 || to > 255 || from > to) {
+    if (input == nullptr || histogram == nullptr) {
+        // Invalid pointers; nothing can be done.
         return;
     }
 
-    const int numBins = to - from + 1;
-    const size_t histBytes = static_cast<size_t>(numBins) * sizeof(unsigned int);
+    // Clamp 'from' and 'to' into the valid [0, 255] range for chars.
+    if (from < 0)   from = 0;
+    if (to   > 255) to   = 255;
 
-    // Zero-initialize output histogram (asynchronous on the default stream).
-    cudaMemset(histogram, 0, histBytes);
-
-    // If there's nothing to process, we're done.
-    if (inputSize == 0) {
+    if (from > to) {
+        // Invalid range; nothing to do.
         return;
     }
 
-    // Choose a reasonable block size. 256 threads is a good balance on A100/H100.
-    const int blockSize = 256;
+    unsigned int range = static_cast<unsigned int>(to - from + 1);
 
-    // Compute dynamic shared memory requirement.
-    const size_t smemBytes = static_cast<size_t>(numBins) * sizeof(unsigned int);
+    // Initialize the histogram buffer on the device to zero.
+    // This is ordered before the kernel launch on the default stream.
+    cudaMemset(histogram, 0, range * sizeof(unsigned int));
 
-    // Determine a grid size that balances throughput and minimizes global merge overhead.
+    // No further work if the input is empty.
+    if (inputSize == 0u) {
+        return;
+    }
+
+    // Choose launch configuration.
+    // 256 threads per block is a good balance for this type of workload.
+    const int threadsPerBlock = 256;
+
+    // Number of blocks needed to cover the input at least once.
+    unsigned int numBlocks = (inputSize + threadsPerBlock - 1) / threadsPerBlock;
+
+    // Optionally cap the number of blocks based on the device SM count
+    // to avoid excessively large grids. This is beneficial when inputSize
+    // is very large because the kernel uses a grid-stride loop.
     int device = 0;
     cudaGetDevice(&device);
+
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
 
-    int blocksPerSM = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, histogram_range_kernel, blockSize, smemBytes);
-    if (blocksPerSM <= 0) {
-        blocksPerSM = 1; // Fallback
+    // Use a reasonable multiple of the number of SMs (e.g., 8 blocks per SM).
+    unsigned int maxBlocks = static_cast<unsigned int>(prop.multiProcessorCount) * 8u;
+    if (maxBlocks == 0u) {
+        maxBlocks = 1u;
     }
 
-    // Upper bound on blocks: a small multiple of fully resident blocks across all SMs.
-    // This keeps the number of global atomic merges manageable even for huge inputs.
-    const int smCount = prop.multiProcessorCount > 0 ? prop.multiProcessorCount : 1;
-    const int maxUsefulBlocks = blocksPerSM * smCount * 4; // Over-subscribe by ~4x to hide memory latency.
+    if (numBlocks > maxBlocks) {
+        numBlocks = maxBlocks;
+    }
+    if (numBlocks == 0u) {
+        numBlocks = 1u;
+    }
 
-    // Also ensure enough blocks to cover the input with at least 1 element per thread on average.
-    const unsigned int gridNeeded = (inputSize + blockSize - 1) / blockSize;
+    // Launch the kernel on the default stream.
+    histogram_kernel<<<numBlocks, threadsPerBlock>>>(input, histogram, inputSize, from, to);
 
-    int gridSize = static_cast<int>(gridNeeded);
-    if (gridSize > maxUsefulBlocks) gridSize = maxUsefulBlocks;
-    if (gridSize < 1) gridSize = 1;
-
-    // Launch kernel. Cast input to unsigned char* for 0..255 values.
-    const unsigned char* d_input = reinterpret_cast<const unsigned char*>(input);
-    histogram_range_kernel<<<gridSize, blockSize, smemBytes>>>(d_input, histogram, inputSize, from, to);
+    // No synchronization or error checking here; the caller is expected to
+    // handle it (e.g., cudaDeviceSynchronize and cudaGetLastError).
 }
