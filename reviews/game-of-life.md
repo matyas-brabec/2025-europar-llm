@@ -1,6 +1,6 @@
 # Game of Life
 
-This file contains an in-depth review of the "one-shot" generated solutions.
+This file contains a summary of the single-response generated solutions.
 
 ## Correctness table
 
@@ -8,15 +8,15 @@ This file contains an in-depth review of the "one-shot" generated solutions.
 | ------------ | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | GoL_01       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
 | GoL_02       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
-| GoL_02_tiled | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌🛠️ | ❌   |
+| GoL_02_tiled | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   | ❌   |
 | GoL_03       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ❌   | ✅   | ✅   |
 | GoL_04       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
-| GoL_05       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
-| GoL_06       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| GoL_05       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ❌   |
+| GoL_06       | ✅   | ❌   | ✅   | ✅   | ❌   | ✅   | ✅   | ✅   | ✅   | ✅   |
 
-✅ – Correct solution (compiled successfully and returned the correct GoL grid): 59/70 (84%)
+✅ – Correct solution (compiled successfully and returned the correct GoL grid): 57/70 (81%)
 
-❌ – Compiled and ran without a runtime error but returned incorrect results: 11/70 (16%)
+❌ – Compiled and ran without a runtime error but returned incorrect results: 13/70 (19%)
 
 ❌💥 – Compiled but crashed during execution: 0/70 (0%)
 

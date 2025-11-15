@@ -1,6 +1,6 @@
 # Histogram reviews
 
-This file contains an in-depth review of the single-response generated solutions.
+This file contains a summary of the single-response generated solutions.
 
 
 ## Correctness table
@@ -10,16 +10,16 @@ This file contains an in-depth review of the single-response generated solutions
 | Histogram01  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
 | Histogram02  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
 | Histogram03  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
-| Histogram04  | ✅  | ✅  | ✅  | ✅ | ✅🛠️ | ✅  | ✅ | ✅🛠️| ✅  | ✅ |
+| Histogram04  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
 | Histogram05  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
-| Histogram06  | ❌  | ✅  | ✅  | ✅ | ✅   | ❌💥| ✅ | ✅  | ✅  | ✅ |
+| Histogram06  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
 | Histogram07  | ✅  | ✅  | ✅  | ✅ | ✅   | ✅  | ✅ | ✅  | ✅  | ✅ |
 
-✅ – Correct solution (compiled successfully and returned the correct GoL grid): 68/70 (97%)
+✅ – Correct solution (compiled successfully and returned the correct results): 70/70 (100%)
 
-❌ – Compiled and ran without a runtime error but returned incorrect results: 1/70 (1%)
+❌ – Compiled and ran without a runtime error but returned incorrect results: 0/70 (0%)
 
-❌💥 – Compiled but crashed during execution: 1/70 (1%)
+❌💥 – Compiled but crashed during execution: 0/70 (0%)
 
 ❌⚙️ – Did not compile: 0/70 (0%)
 
