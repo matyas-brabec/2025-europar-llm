@@ -13,13 +13,13 @@ from openai.types.chat.chat_completion import ChatCompletion
 from munch import munchify
 
 
-MODEL = "gpt-5.1-2025-11-13"
-REASONING_EFFORT = "high"
+MODEL = "gpt-5.4-2026-03-05"
+REASONING_EFFORT = "xhigh"
 VERBOSITY = "medium"
 
-# Source: https://platform.openai.com/docs/models/gpt-5.1
-COST_INPUT = 1.25 / 1_000_000
-COST_OUTPUT = 10 / 1_000_000
+# Source: https://platform.openai.com/docs/models/gpt-5.4
+COST_INPUT = 2.5 / 1_000_000
+COST_OUTPUT = 15 / 1_000_000
 
 
 load_dotenv(find_dotenv(), override=True)  # take environment variables from .env
