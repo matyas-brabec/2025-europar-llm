@@ -34,4 +34,5 @@ clean:
 	rm -rf $(BIN_DIR)
 
 run: $(EXECUTABLE)
-	@python run-code.py $(GOL_IMPL)
+	@timeout 2m \
+	python run-code.py $(GOL_IMPL)

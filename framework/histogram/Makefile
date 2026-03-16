@@ -32,7 +32,8 @@ $(TARGET): $(TARGET).cpp $(HEADERS) $(KERNEL_OBJS)
 
 
 run:
-	@./histogram --algorithm cuda --verify --warmup --fromValue 32 --toValue 127 --repeatInput 16k ./data/lorem_small.$(DATA)
+	@timeout 2m \
+	./histogram --algorithm cuda --verify --warmup --fromValue 32 --toValue 127 --repeatInput 16k ./data/lorem_small.$(DATA)
 
 # Cleaning Stuff
 
