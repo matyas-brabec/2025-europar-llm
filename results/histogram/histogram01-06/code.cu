@@ -1,112 +1,277 @@
 #include <cuda_runtime.h>
+#include <cstdint>
+
+namespace detail {
 
 /*
- * CUDA kernel to compute a histogram over a specified inclusive character range [from, to].
+ * Range-restricted byte histogram tuned for modern data-center GPUs (A100/H100 class).
  *
- * Parameters:
- *   input      - device pointer to input characters
- *   histogram  - device pointer to global histogram array of size (to - from + 1)
- *   inputSize  - number of characters in input
- *   from, to   - inclusive character range [from, to] to be histogrammed
+ * Design choices:
+ *  - One 256-counter shared histogram per warp (warp-private slices). This removes
+ *    inter-warp contention in the hot accumulation path.
+ *  - The aligned bulk of the input is consumed via 16-byte vector loads (uint4).
+ *  - Within a warp, lanes targeting the same bin are coalesced with __match_any_sync(),
+ *    so the shared histogram sees one update per distinct value seen by the participating
+ *    lanes instead of one update per byte.
+ *  - One final merge per block/bin into the global output.
  *
- * Strategy:
- *   - Each block maintains a private histogram in shared memory to reduce global atomic contention.
- *   - Threads cooperatively initialize the shared histogram.
- *   - Threads process input using a grid-stride loop and update shared histogram with atomics.
- *   - After processing, threads cooperatively accumulate the shared histogram into the global histogram.
+ * Bytes are always interpreted as unsigned values in [0, 255], independent of the
+ * implementation-defined signedness of plain 'char'.
  */
-__global__ void histogram_kernel(const char * __restrict__ input,
-                                 unsigned int * __restrict__ histogram,
-                                 unsigned int inputSize,
-                                 int from,
-                                 int to)
-{
-    extern __shared__ unsigned int s_hist[];
+constexpr int kBlockSize = 256;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = kBlockSize / kWarpSize;
+constexpr unsigned int kAlphabetBins = 256u;
+constexpr unsigned int kVectorBytes = 16u;
+constexpr unsigned int kVectorAlignMask = kVectorBytes - 1u;
 
-    const int numBins = to - from + 1;
-    const bool fullRange = (from == 0) && (to == 255);
+/*
+ * A fixed cap of 1024 blocks is close to ~8 resident-like blocks/SM on A100/H100-class
+ * parts while avoiding too much per-block merge overhead once the device is saturated.
+ */
+constexpr unsigned int kMaxGridBlocks = 1024u;
 
-    // Initialize shared histogram to zero
-    for (int i = threadIdx.x; i < numBins; i += blockDim.x) {
-        s_hist[i] = 0;
+/*
+ * Launch heuristic: wider requested ranges require more per-block initialization/merge work,
+ * so give each block more input to amortize that overhead.
+ */
+constexpr unsigned int kMinTargetBytesPerBlock = 8u * 1024u;
+constexpr unsigned int kTargetBytesPerRequestedBin = 64u;
+
+static_assert(kBlockSize % kWarpSize == 0, "Block size must be a multiple of warp size.");
+
+template <bool kFullRange>
+struct ByteAccumulator;
+
+template <>
+struct ByteAccumulator<true> {
+    __device__ __forceinline__
+    static void add(const unsigned int byte_value,
+                    unsigned int* const warp_hist,
+                    const unsigned int /*from*/,
+                    const unsigned int /*bins*/,
+                    const unsigned int lane,
+                    const unsigned int active_mask)
+    {
+        const unsigned int peers = __match_any_sync(active_mask, byte_value);
+        const unsigned int leader_lane = static_cast<unsigned int>(__ffs(peers) - 1);
+        if (lane == leader_lane) {
+            const unsigned int count = static_cast<unsigned int>(__popc(peers));
+            /*
+             * Even though each warp owns its own shared-memory slice, keeping the update as
+             * an atomicAdd makes the code correct independent of compiler predication choices
+             * and independent thread scheduling. On Ampere/Hopper, shared-memory atomics are
+             * fast, and __match_any_sync() has already reduced the update rate sharply.
+             */
+            atomicAdd(warp_hist + byte_value, count);
+        }
     }
-    __syncthreads();
+};
 
-    // Compute global thread index and stride using 64-bit to avoid overflow
-    size_t tid    = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+template <>
+struct ByteAccumulator<false> {
+    __device__ __forceinline__
+    static void add(const unsigned int byte_value,
+                    unsigned int* const warp_hist,
+                    const unsigned int from,
+                    const unsigned int bins,
+                    const unsigned int lane,
+                    const unsigned int active_mask)
+    {
+        /*
+         * Unsigned subtraction lets one compare implement both bounds:
+         * bytes below 'from' underflow to a large unsigned value and fail idx < bins.
+         */
+        const unsigned int idx = byte_value - from;
+        const bool valid = idx < bins;
+        const unsigned int valid_mask = __ballot_sync(active_mask, valid);
 
-    // Grid-stride loop over input
-    for (size_t i = tid; i < static_cast<size_t>(inputSize); i += stride) {
-        unsigned char c = static_cast<unsigned char>(input[i]);
-        int code = static_cast<int>(c);
-
-        if (fullRange) {
-            // Fast path for full 0-255 range: no range check needed
-            atomicAdd(&s_hist[code], 1U);
-        } else {
-            // General case: only count characters in [from, to]
-            if (code >= from && code <= to) {
-                int idx = code - from;  // bin index in [0, numBins-1]
-                atomicAdd(&s_hist[idx], 1U);
+        if (valid) {
+            const unsigned int peers = __match_any_sync(valid_mask, idx);
+            const unsigned int leader_lane = static_cast<unsigned int>(__ffs(peers) - 1);
+            if (lane == leader_lane) {
+                const unsigned int count = static_cast<unsigned int>(__popc(peers));
+                atomicAdd(warp_hist + idx, count);
             }
         }
     }
+};
+
+template <bool kFullRange>
+__device__ __forceinline__
+void process_word(const unsigned int word,
+                  unsigned int* const warp_hist,
+                  const unsigned int from,
+                  const unsigned int bins,
+                  const unsigned int lane,
+                  const unsigned int active_mask)
+{
+    ByteAccumulator<kFullRange>::add( word        & 0xFFu, warp_hist, from, bins, lane, active_mask);
+    ByteAccumulator<kFullRange>::add((word >>  8) & 0xFFu, warp_hist, from, bins, lane, active_mask);
+    ByteAccumulator<kFullRange>::add((word >> 16) & 0xFFu, warp_hist, from, bins, lane, active_mask);
+    ByteAccumulator<kFullRange>::add((word >> 24) & 0xFFu, warp_hist, from, bins, lane, active_mask);
+}
+
+template <bool kFullRange>
+__global__ __launch_bounds__(kBlockSize)
+void histogram_kernel(const unsigned char* __restrict__ input,
+                      unsigned int* __restrict__ histogram,
+                      const unsigned int inputSize,
+                      const unsigned int from,
+                      const unsigned int bins)
+{
+    __shared__ unsigned int s_hist[kWarpsPerBlock][kAlphabetBins];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & (kWarpSize - 1u);
+    const unsigned int warp_id = tid >> 5;
+    unsigned int* const warp_hist = s_hist[warp_id];
+
+    /* Only initialize the requested bin subset; the rest of the 256-entry slice is unused. */
+    for (unsigned int bin = lane; bin < bins; bin += kWarpSize) {
+        warp_hist[bin] = 0u;
+    }
+    __syncthreads();
+
+    const unsigned int global_thread = blockIdx.x * blockDim.x + tid;
+    const unsigned int grid_threads = gridDim.x * blockDim.x;
+
+    /* Align the main bulk to 16 bytes so the vectorized loop can use uint4 loads safely. */
+    const unsigned int misalignment =
+        static_cast<unsigned int>(reinterpret_cast<std::uintptr_t>(input) & kVectorAlignMask);
+    unsigned int prefix = (kVectorBytes - misalignment) & kVectorAlignMask;
+    if (prefix > inputSize) {
+        prefix = inputSize;
+    }
+
+    /*
+     * The prefix is shorter than 16 bytes, so assigning it to the first few global threads
+     * is enough and avoids an extra scalar loop.
+     */
+    if (global_thread < prefix) {
+        const unsigned int active_mask = __activemask();
+        ByteAccumulator<kFullRange>::add(
+            static_cast<unsigned int>(input[global_thread]),
+            warp_hist,
+            from,
+            bins,
+            lane,
+            active_mask);
+    }
+
+    const unsigned char* const aligned_input = input + prefix;
+    const unsigned int vec_bytes = (inputSize - prefix) & ~kVectorAlignMask;
+    const unsigned int num_vec = vec_bytes / kVectorBytes;
+    const uint4* const input4 = reinterpret_cast<const uint4*>(aligned_input);
+
+    for (unsigned int i = global_thread; i < num_vec; i += grid_threads) {
+        const unsigned int active_mask = __activemask();
+        const uint4 v = input4[i];
+        process_word<kFullRange>(v.x, warp_hist, from, bins, lane, active_mask);
+        process_word<kFullRange>(v.y, warp_hist, from, bins, lane, active_mask);
+        process_word<kFullRange>(v.z, warp_hist, from, bins, lane, active_mask);
+        process_word<kFullRange>(v.w, warp_hist, from, bins, lane, active_mask);
+    }
+
+    const unsigned int tail_start = prefix + vec_bytes;
+    const unsigned int tail_bytes = inputSize - tail_start;
+
+    /* Like the prefix, the tail is also shorter than 16 bytes. */
+    if (global_thread < tail_bytes) {
+        const unsigned int active_mask = __activemask();
+        ByteAccumulator<kFullRange>::add(
+            static_cast<unsigned int>(input[tail_start + global_thread]),
+            warp_hist,
+            from,
+            bins,
+            lane,
+            active_mask);
+    }
 
     __syncthreads();
 
-    // Accumulate per-block shared histogram into global histogram
-    for (int i = threadIdx.x; i < numBins; i += blockDim.x) {
-        unsigned int val = s_hist[i];
-        if (val > 0) {
-            atomicAdd(&histogram[i], val);
+    /*
+     * Merge warp-private shared histograms into the output.
+     * - Single-block launch: direct stores avoid both a memset and global atomics.
+     * - Multi-block launch: one global atomic per non-zero bin/block.
+     */
+    for (unsigned int bin = tid; bin < bins; bin += blockDim.x) {
+        unsigned int sum = 0u;
+#pragma unroll
+        for (int w = 0; w < kWarpsPerBlock; ++w) {
+            sum += s_hist[w][bin];
+        }
+
+        if (gridDim.x == 1) {
+            histogram[bin] = sum;
+        } else if (sum != 0u) {
+            atomicAdd(histogram + bin, sum);
         }
     }
 }
 
-/*
- * Host function to run the histogram kernel.
- *
- * Parameters:
- *   input      - device pointer to input characters (cudaMalloc'd)
- *   histogram  - device pointer to histogram array (cudaMalloc'd),
- *                must have space for (to - from + 1) unsigned ints
- *   inputSize  - number of characters in input
- *   from, to   - inclusive character range [from, to] to be histogrammed
- *
- * Notes:
- *   - This function does not perform any device synchronization; the caller is responsible
- *     for synchronization and error checking if desired.
- *   - The histogram array is zeroed before the kernel launch.
- */
+}  // namespace detail
+
 void run_histogram(const char *input,
                    unsigned int *histogram,
                    unsigned int inputSize,
                    int from,
                    int to)
 {
-    // Compute number of histogram bins (inclusive range)
-    const int numBins = to - from + 1;
+    /*
+     * Preconditions from the prompt:
+     *   - 0 <= from < to <= 255
+     *   - input and histogram are device pointers allocated by cudaMalloc
+     *   - histogram has length (to - from + 1)
+     *
+     * By design, this function only enqueues work on the default stream and does not
+     * synchronize; ordering/error handling beyond launch submission is left to the caller.
+     */
+    const unsigned int bins = static_cast<unsigned int>(to - from + 1);
+    const size_t histogram_bytes = static_cast<size_t>(bins) * sizeof(unsigned int);
 
-    // Clear the global histogram to zero
-    cudaMemset(histogram, 0, static_cast<size_t>(numBins) * sizeof(unsigned int));
-
-    // If there is no input, nothing more to do
-    if (inputSize == 0) {
+    if (inputSize == 0u) {
+        cudaMemsetAsync(histogram, 0, histogram_bytes, 0);
         return;
     }
 
-    // Configure CUDA kernel launch parameters
-    const int blockSize = 256;  // typical choice for modern GPUs
-    int gridSize = (static_cast<int>(inputSize) + blockSize - 1) / blockSize;
+    unsigned int target_bytes_per_block = bins * detail::kTargetBytesPerRequestedBin;
+    if (target_bytes_per_block < detail::kMinTargetBytesPerBlock) {
+        target_bytes_per_block = detail::kMinTargetBytesPerBlock;
+    }
 
-    // Shared memory size per block: one unsigned int per bin
-    size_t sharedMemSize = static_cast<size_t>(numBins) * sizeof(unsigned int);
+    unsigned int blocks = 1u + (inputSize - 1u) / target_bytes_per_block;
+    if (blocks > detail::kMaxGridBlocks) {
+        blocks = detail::kMaxGridBlocks;
+    }
 
-    // Launch the histogram kernel
-    histogram_kernel<<<gridSize, blockSize, sharedMemSize>>>(input,
-                                                             histogram,
-                                                             inputSize,
-                                                             from,
-                                                             to);
+    /*
+     * When only one block is used, the kernel writes the complete result directly,
+     * so a separate memset is unnecessary.
+     */
+    if (blocks != 1u) {
+        cudaMemsetAsync(histogram, 0, histogram_bytes, 0);
+    }
+
+    const dim3 grid(blocks);
+    const dim3 block(detail::kBlockSize);
+    const unsigned char* const input_u8 = reinterpret_cast<const unsigned char*>(input);
+    const unsigned int from_u = static_cast<unsigned int>(from);
+
+    /* Fast path for the full [0,255] alphabet: no range check in the hot loop. */
+    if (from == 0 && bins == detail::kAlphabetBins) {
+        detail::histogram_kernel<true><<<grid, block>>>(
+            input_u8,
+            histogram,
+            inputSize,
+            0u,
+            detail::kAlphabetBins);
+    } else {
+        detail::histogram_kernel<false><<<grid, block>>>(
+            input_u8,
+            histogram,
+            inputSize,
+            from_u,
+            bins);
+    }
 }

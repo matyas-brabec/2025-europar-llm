@@ -1,226 +1,339 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-/*
- * CUDA implementation of a single-step update for Conway's Game of Life
- * on a square grid, bit-packed into 64-bit words (one bit per cell).
- *
- * Representation:
- *  - Grid is grid_dim x grid_dim cells, grid_dim is a power of two (> 512).
- *  - Each row is stored as consecutive std::uint64_t words.
- *  - Bit i (0 <= i < 64) of word w in row r represents cell at (x = 64*w + i, y = r).
- *  - A bit value of 1 means "alive", 0 means "dead".
- *
- * Boundary conditions:
- *  - All cells outside the grid are considered dead.
- *
- * Parallelization strategy:
- *  - Each CUDA thread processes one 64-bit word: 64 cells in a row.
- *  - For each word at position (row, w), the thread reads at most 9 words:
- *    the current word and its neighbors in the 3x3 block of words
- *    (left, center, right in current, above, and below rows).
- *
- * Neighbor counting (bit-parallel):
- *  - For each word, we construct 8 bitboards, each encoding one of the 8
- *    neighbor directions for all 64 cells simultaneously:
- *      NW, N, NE, W, E, SW, S, SE.
- *  - Horizontal adjacency across 64-bit word boundaries is handled by combining
- *    the left/right neighbor words when shifting.
- *  - We then add these 8 one-bit-per-cell bitboards using a per-bit
- *    ripple-carry adder implemented with bitwise operations. This yields the
- *    neighbor count modulo 8 for each cell in three bitboards:
- *      ones  -> bit 0 (1)
- *      twos  -> bit 1 (2)
- *      fours -> bit 2 (4)
- *    Counts are correct modulo 8; since we only need to detect counts 2 and 3,
- *    modulo arithmetic is sufficient (8 neighbors -> 0 mod 8, never misidentified
- *    as 2 or 3).
- *
- * Game of Life rule:
- *  - Let center be the bitboard of current cell states for this 64-cell segment.
- *  - From (ones, twos, fours) we build two masks:
- *      eq2: cells with exactly 2 neighbors (binary 010)
- *      eq3: cells with exactly 3 neighbors (binary 011)
- *  - New state per bit:
- *      new = (neighbors == 3) || (alive && neighbors == 2)
- *           = eq3 | (center & eq2)
- */
+// One Conway step directly on the bit-packed device representation.
+//
+// Layout / bit order:
+// - The grid is row-major in 64-bit words.
+// - Bit i of each word stores cell x = word_base + i, i.e. LSB -> increasing x.
+//
+// Performance-oriented design for A100/H100-class GPUs:
+// - One lane updates one 64-bit word = 64 cells at once.
+// - Horizontal neighbor words come from warp shuffles, so only subgroup-boundary
+//   lanes issue extra global loads.
+// - No shared memory: for this access pattern, shuffles + hardware caches are
+//   sufficient and simpler.
+// - Neighbor counts are formed with bit-sliced boolean arithmetic. Only counts
+//   2 and 3 matter for Life, so keeping the count modulo 8 is enough; the only
+//   wrapped case is count 8 -> 0, which is harmless for the rule.
+// - The 1024x1024 case (16 words/row) is specialized so each hardware warp
+//   updates two rows via two independent 16-lane subgroups.
 
-/* Device helper: add a bitboard of 0/1 values into a 3-bit per-cell accumulator.
- *
- * Parameters:
- *   n      - input bitboard (each bit is 0 or 1, representing a neighbor presence)
- *   ones   - accumulator LSBs (bit 0 of neighbor count per cell)
- *   twos   - accumulator middle bits (bit 1 of neighbor count per cell)
- *   fours  - accumulator MSBs (bit 2 of neighbor count per cell)
- *
- * After the call, (fours, twos, ones) represent the count modulo 8 of all
- * neighbors added so far at each bit position.
- */
-__device__ __forceinline__
-void add_bitboard(std::uint64_t n,
-                  std::uint64_t &ones,
-                  std::uint64_t &twos,
-                  std::uint64_t &fours)
-{
-    // Ripple-carry binary addition of 1-bit n into the 3-bit value (fours, twos, ones)
-    // per bit position. All operations are bitwise and therefore operate on 64
-    // independent circuits in parallel.
+namespace {
 
-    // Add n to ones (LSB).
-    std::uint64_t carry0 = ones & n;
-    ones ^= n;
+using u64 = std::uint64_t;
 
-    // Propagate carry into twos (next bit).
-    std::uint64_t carry1 = twos & carry0;
-    twos ^= carry0;
+constexpr int kWarpSize               = 32;
+constexpr int kHalfWarpSize           = 16;
+constexpr int kWarpsPerBlock          = 8;
+constexpr int kBlockThreads           = kWarpSize * kWarpsPerBlock;
+constexpr unsigned int kWarpWordShift = 5u;  // log2(32 words)
+constexpr unsigned int kHalfRowShift  = 4u;  // log2(16 words)
+constexpr u64 kHalfWordsPerRow        = 1ull << kHalfRowShift;
 
-    // Propagate carry into fours (third bit). We ignore overflow beyond fours (mod 8).
-    fours ^= carry1;
+// Majority of three 64-bit bitboards. Written in a form NVCC lowers well.
+__device__ __forceinline__ u64 majority3(u64 a, u64 b, u64 c) {
+    return (a & b) | (c & (a | b));
 }
 
-/* CUDA kernel: compute one Game of Life step on a bit-packed grid. */
-__global__
-void game_of_life_kernel(const std::uint64_t* __restrict__ input,
-                         std::uint64_t* __restrict__ output,
-                         int grid_dim,
-                         int words_per_row)
+// Load the current word and its left/right neighbor words from the same row.
+// The subgroup width is either 32 (full warp) or 16 (half warp specialization).
+// __activemask() is intentionally captured here so the same helper remains
+// correct inside the half-warp kernel's top/bottom boundary-divergent branches.
+template <int GROUP_WIDTH>
+__device__ __forceinline__ void load_triplet(
+    const u64* __restrict__ input,
+    u64 word_index,
+    u64 x_word,
+    u64 words_per_row,
+    unsigned int lane_local,
+    u64& left,
+    u64& center,
+    u64& right)
 {
-    // 2D thread coordinates mapped to (word index within row, row index).
-    int w   = blockIdx.x * blockDim.x + threadIdx.x; // word index in row
-    int row = blockIdx.y * blockDim.y + threadIdx.y; // row index
+    const unsigned int mask = __activemask();
 
-    if (w >= words_per_row || row >= grid_dim)
-        return;
+    center = input[word_index];
 
-    // Precompute row base index into the 1D input/output arrays.
-    const int row_base = row * words_per_row;
-
-    // Flags for boundary handling.
-    const bool has_left_word  = (w > 0);
-    const bool has_right_word = (w + 1 < words_per_row);
-    const bool has_above      = (row > 0);
-    const bool has_below      = (row + 1 < grid_dim);
-
-    // Load current row words: center, left, right.
-    const std::uint64_t cC = input[row_base + w];
-    const std::uint64_t cL = has_left_word  ? input[row_base + (w - 1)] : 0ull;
-    const std::uint64_t cR = has_right_word ? input[row_base + (w + 1)] : 0ull;
-
-    // Load above row words if present.
-    std::uint64_t aL = 0ull, aC = 0ull, aR = 0ull;
-    if (has_above) {
-        const int above_base = row_base - words_per_row;
-        aC = input[above_base + w];
-        aL = has_left_word  ? input[above_base + (w - 1)] : 0ull;
-        aR = has_right_word ? input[above_base + (w + 1)] : 0ull;
+    left = __shfl_up_sync(mask, center, 1, GROUP_WIDTH);
+    if (lane_local == 0) {
+        left = (x_word != 0) ? input[word_index - 1] : 0ull;
     }
 
-    // Load below row words if present.
-    std::uint64_t bL = 0ull, bC = 0ull, bR = 0ull;
-    if (has_below) {
-        const int below_base = row_base + words_per_row;
-        bC = input[below_base + w];
-        bL = has_left_word  ? input[below_base + (w - 1)] : 0ull;
-        bR = has_right_word ? input[below_base + (w + 1)] : 0ull;
+    right = __shfl_down_sync(mask, center, 1, GROUP_WIDTH);
+    if (lane_local == static_cast<unsigned int>(GROUP_WIDTH - 1)) {
+        right = (x_word + 1 < words_per_row) ? input[word_index + 1] : 0ull;
     }
-
-    // Construct neighbor bitboards for above row (NW, N, NE).
-    // Horizontal neighbors across word boundaries are handled via shifts that
-    // include bits from left/right words.
-    std::uint64_t above_W = 0ull;
-    std::uint64_t above_C = 0ull;
-    std::uint64_t above_E = 0ull;
-    if (has_above) {
-        above_W = (aC << 1) | (aL >> 63);  // cells at (row-1, x-1)
-        above_C = aC;                      // cells at (row-1, x)
-        above_E = (aC >> 1) | (aR << 63);  // cells at (row-1, x+1)
-    }
-
-    // Construct neighbor bitboards for below row (SW, S, SE).
-    std::uint64_t below_W = 0ull;
-    std::uint64_t below_C = 0ull;
-    std::uint64_t below_E = 0ull;
-    if (has_below) {
-        below_W = (bC << 1) | (bL >> 63);  // cells at (row+1, x-1)
-        below_C = bC;                      // cells at (row+1, x)
-        below_E = (bC >> 1) | (bR << 63);  // cells at (row+1, x+1)
-    }
-
-    // Construct neighbor bitboards for current row (W, E).
-    const std::uint64_t curr_W = (cC << 1) | (cL >> 63);  // cells at (row, x-1)
-    const std::uint64_t curr_E = (cC >> 1) | (cR << 63);  // cells at (row, x+1)
-
-    // Accumulate neighbor counts (modulo 8) into (ones, twos, fours).
-    std::uint64_t ones  = 0ull;
-    std::uint64_t twos  = 0ull;
-    std::uint64_t fours = 0ull;
-
-    add_bitboard(above_W, ones, twos, fours); // NW
-    add_bitboard(above_C, ones, twos, fours); // N
-    add_bitboard(above_E, ones, twos, fours); // NE
-    add_bitboard(curr_W,  ones, twos, fours); // W
-    add_bitboard(curr_E,  ones, twos, fours); // E
-    add_bitboard(below_W, ones, twos, fours); // SW
-    add_bitboard(below_C, ones, twos, fours); // S
-    add_bitboard(below_E, ones, twos, fours); // SE
-
-    // Current cell states for this word.
-    const std::uint64_t center = cC;
-
-    // Compute masks for exactly 2 and exactly 3 neighbors.
-    // Count bits per cell: (fours, twos, ones) representing 0..7 modulo 8.
-    //  - neighbors == 2 -> 010
-    //  - neighbors == 3 -> 011
-    const std::uint64_t not_fours = ~fours;
-    const std::uint64_t eq2 = not_fours &  twos & ~ones;
-    const std::uint64_t eq3 = not_fours &  twos &  ones;
-
-    // Apply Game of Life rule:
-    // new = (neighbors == 3) || (alive && neighbors == 2)
-    const std::uint64_t next = eq3 | (center & eq2);
-
-    // Store updated word.
-    output[row_base + w] = next;
 }
 
-/*
- * Host wrapper: execute one step of Conway's Game of Life on a bit-packed grid.
- *
- * Parameters:
- *   input           - device pointer to input grid (bit-packed std::uint64_t words)
- *   output          - device pointer to output grid (same layout as input)
- *   grid_dimensions - width and height of the square grid (power of 2, > 512)
- *
- * Notes:
- *   - input and output must be allocated with cudaMalloc and have at least
- *     (grid_dimensions * grid_dimensions / 64) 64-bit elements.
- *   - This function launches the CUDA kernel but does not perform any
- *     synchronization; the caller is responsible for cudaDeviceSynchronize()
- *     or using CUDA events as needed.
- */
-void run_game_of_life(const std::uint64_t* input,
-                      std::uint64_t* output,
-                      int grid_dimensions)
+// Encode a neighboring row's 3-cell horizontal stencil (west, center, east)
+// into two bitplanes: lo + 2*hi, i.e. the population count 0..3 for each bit.
+template <int GROUP_WIDTH>
+__device__ __forceinline__ void encode_three_cell_row(
+    const u64* __restrict__ input,
+    u64 word_index,
+    u64 x_word,
+    u64 words_per_row,
+    unsigned int lane_local,
+    u64& lo,
+    u64& hi)
 {
-    // Number of 64-bit words per row (grid_dimensions is a power of two, so
-    // division by 64 is exact).
-    const int words_per_row = grid_dimensions >> 6; // grid_dimensions / 64
+    u64 left, center, right;
+    load_triplet<GROUP_WIDTH>(input, word_index, x_word, words_per_row, lane_local,
+                              left, center, right);
 
-    // Configure CUDA launch parameters.
-    // Using a 2D grid where:
-    //   - x-dimension covers words within a row,
-    //   - y-dimension covers rows.
-    const dim3 blockDim(32, 8); // 256 threads per block
-    const dim3 gridDim(
-        (words_per_row   + blockDim.x - 1) / blockDim.x,
-        (grid_dimensions + blockDim.y - 1) / blockDim.y
-    );
+    const u64 west = (center << 1) | (left >> 63);
+    const u64 east = (center >> 1) | (right << 63);
 
-    // Launch kernel. Caller handles error checking and synchronization.
-    game_of_life_kernel<<<gridDim, blockDim>>>(input, output,
-                                               grid_dimensions,
-                                               words_per_row);
+    lo = west ^ center ^ east;
+    hi = majority3(west, center, east);
+}
+
+// Encode the current row's horizontal neighbors (west/east only; the center
+// cell itself is excluded from the neighbor count) into two bitplanes.
+template <int GROUP_WIDTH>
+__device__ __forceinline__ void encode_two_cell_row(
+    const u64* __restrict__ input,
+    u64 word_index,
+    u64 x_word,
+    u64 words_per_row,
+    unsigned int lane_local,
+    u64& self_word,
+    u64& lo,
+    u64& hi)
+{
+    u64 left, center, right;
+    load_triplet<GROUP_WIDTH>(input, word_index, x_word, words_per_row, lane_local,
+                              left, center, right);
+
+    self_word = center;
+
+    const u64 west = (center << 1) | (left >> 63);
+    const u64 east = (center >> 1) | (right << 63);
+
+    lo = west ^ east;
+    hi = west & east;
+}
+
+// Combine:
+//   north_count = n0 + 2*n1   (0..3)
+//   mid_count   = m0 + 2*m1   (0..2)
+//   south_count = s0 + 2*s1   (0..3)
+// into the 3 low bits of the total neighbor count.
+//
+// Count 8 wraps to 0 modulo 8; that is fine because the Life rule only accepts
+// counts 2 and 3. The final boolean is:
+//   next = (count == 3) | (self & (count == 2))
+//        = cnt1 & ~cnt2 & (cnt0 | self)
+__device__ __forceinline__ u64 finalize_word(
+    u64 self_word,
+    u64 n0, u64 n1,
+    u64 m0, u64 m1,
+    u64 s0, u64 s1)
+{
+    const u64 cnt0 = n0 ^ m0 ^ s0;
+    const u64 carry0 = majority3(n0, m0, s0);
+
+    const u64 pair01_lo = n1 ^ m1;
+    const u64 pair01_hi = n1 & m1;
+    const u64 pair23_lo = s1 ^ carry0;
+    const u64 pair23_hi = s1 & carry0;
+
+    const u64 cnt1 = pair01_lo ^ pair23_lo;
+    const u64 cnt2 = pair01_hi ^ pair23_hi ^ (pair01_lo & pair23_lo);
+
+    return (cnt1 & ~cnt2) & (cnt0 | self_word);
+}
+
+// Full-warp kernel for rows with at least 32 packed words (grid >= 2048).
+// Task space is "one 32-word tile of one row per hardware warp". Because the
+// row length is a power of two, row index and x-within-row are recovered with
+// shifts/masks instead of division/modulo.
+__global__ __launch_bounds__(kBlockThreads)
+void game_of_life_kernel_full(
+    const u64* __restrict__ input,
+    u64* __restrict__ output,
+    u64 rows,
+    unsigned int words_per_row_shift)
+{
+    const unsigned int lane = threadIdx.x;
+    const unsigned int warp_in_block = threadIdx.y;
+
+    const u64 words_per_row = 1ull << words_per_row_shift;
+    const u64 row_mask      = words_per_row - 1ull;
+    const unsigned int task_shift = words_per_row_shift - kWarpWordShift;
+    const u64 total_tasks = rows << task_shift;
+
+    const u64 warp_id     = static_cast<u64>(blockIdx.x) * kWarpsPerBlock + warp_in_block;
+    const u64 warp_stride = static_cast<u64>(gridDim.x) * kWarpsPerBlock;
+
+    for (u64 task = warp_id; task < total_tasks; task += warp_stride) {
+        const u64 word_index = (task << kWarpWordShift) | static_cast<u64>(lane);
+        const u64 y          = task >> task_shift;
+        const u64 x_word     = word_index & row_mask;
+
+        u64 n0 = 0ull, n1 = 0ull;
+        if (y != 0) {
+            encode_three_cell_row<kWarpSize>(
+                input, word_index - words_per_row, x_word, words_per_row, lane, n0, n1);
+        }
+
+        u64 self_word, m0, m1;
+        encode_two_cell_row<kWarpSize>(
+            input, word_index, x_word, words_per_row, lane, self_word, m0, m1);
+
+        u64 s0 = 0ull, s1 = 0ull;
+        if (y + 1 < rows) {
+            encode_three_cell_row<kWarpSize>(
+                input, word_index + words_per_row, x_word, words_per_row, lane, s0, s1);
+        }
+
+        output[word_index] = finalize_word(self_word, n0, n1, m0, m1, s0, s1);
+    }
+}
+
+// Specialized kernel for exactly 16 packed words per row (1024 cells/row).
+// Each hardware warp updates two rows at once using two 16-lane subgroups.
+__global__ __launch_bounds__(kBlockThreads)
+void game_of_life_kernel_half(
+    const u64* __restrict__ input,
+    u64* __restrict__ output,
+    u64 rows)
+{
+    const unsigned int lane       = threadIdx.x;
+    const unsigned int warp_in_block = threadIdx.y;
+    const unsigned int subwarp    = lane >> kHalfRowShift;            // 0 or 1
+    const unsigned int lane16     = lane & (kHalfWarpSize - 1);      // 0..15
+    const u64 x_word              = static_cast<u64>(lane16);
+
+    const u64 pair_count  = rows >> 1; // rows is guaranteed even
+    const u64 pair_id     = static_cast<u64>(blockIdx.x) * kWarpsPerBlock + warp_in_block;
+    const u64 pair_stride = static_cast<u64>(gridDim.x) * kWarpsPerBlock;
+
+    for (u64 pair = pair_id; pair < pair_count; pair += pair_stride) {
+        const u64 y = (pair << 1) | static_cast<u64>(subwarp);
+
+        // One pair contains two rows * 16 words = 32 words total.
+        const u64 word_index =
+            (pair << kWarpWordShift) |
+            (static_cast<u64>(subwarp) << kHalfRowShift) |
+            x_word;
+
+        u64 n0 = 0ull, n1 = 0ull;
+        if (y != 0) {
+            encode_three_cell_row<kHalfWarpSize>(
+                input, word_index - kHalfWordsPerRow, x_word, kHalfWordsPerRow, lane16, n0, n1);
+        }
+
+        u64 self_word, m0, m1;
+        encode_two_cell_row<kHalfWarpSize>(
+            input, word_index, x_word, kHalfWordsPerRow, lane16, self_word, m0, m1);
+
+        u64 s0 = 0ull, s1 = 0ull;
+        if (y + 1 < rows) {
+            encode_three_cell_row<kHalfWarpSize>(
+                input, word_index + kHalfWordsPerRow, x_word, kHalfWordsPerRow, lane16, s0, s1);
+        }
+
+        output[word_index] = finalize_word(self_word, n0, n1, m0, m1, s0, s1);
+    }
+}
+
+inline u64 ceil_div_u64(u64 n, u64 d) {
+    return (n + d - 1ull) / d;
+}
+
+inline unsigned int log2_pow2_u64(u64 x) {
+    unsigned int s = 0;
+    while (x > 1ull) {
+        x >>= 1;
+        ++s;
+    }
+    return s;
+}
+
+// For grid-stride kernels, launching roughly one fully resident wave of blocks
+// avoids underfilling the GPU without overscheduling far beyond residency.
+inline unsigned int choose_grid_blocks(u64 task_count, int sm_count, int blocks_per_sm) {
+    const u64 blocks_needed = ceil_div_u64(task_count, static_cast<u64>(kWarpsPerBlock));
+    const u64 resident_blocks =
+        static_cast<u64>(sm_count > 0 ? sm_count : 1) *
+        static_cast<u64>(blocks_per_sm > 0 ? blocks_per_sm : 1);
+
+    u64 blocks = (blocks_needed < resident_blocks) ? blocks_needed : resident_blocks;
+    if (blocks == 0) blocks = 1;
+    return static_cast<unsigned int>(blocks);
+}
+
+// Cached per host thread / current device. These queries are host-side only,
+// and caching keeps repeated time-step launches cheap.
+struct LaunchConfigCache {
+    int device = -1;
+    int sm_count = 0;
+    int full_blocks_per_sm = 0;
+    int half_blocks_per_sm = 0;
+};
+
+inline const LaunchConfigCache& get_launch_config_cache() {
+    thread_local LaunchConfigCache cache;
+
+    int device = 0;
+    cudaGetDevice(&device);
+
+    if (device != cache.device) {
+        cache.device = device;
+
+        cudaDeviceGetAttribute(&cache.sm_count, cudaDevAttrMultiProcessorCount, device);
+
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &cache.full_blocks_per_sm,
+            game_of_life_kernel_full,
+            kBlockThreads,
+            0);
+
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &cache.half_blocks_per_sm,
+            game_of_life_kernel_half,
+            kBlockThreads,
+            0);
+
+        if (cache.sm_count < 1) cache.sm_count = 1;
+        if (cache.full_blocks_per_sm < 1) cache.full_blocks_per_sm = 1;
+        if (cache.half_blocks_per_sm < 1) cache.half_blocks_per_sm = 1;
+    }
+
+    return cache;
+}
+
+} // namespace
+
+void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
+    // Hot-path launcher: no synchronization and no error checking here by design.
+    // The caller owns synchronization/error semantics and must provide distinct
+    // input/output device buffers.
+
+    const u64 rows = static_cast<u64>(grid_dimensions);
+    const u64 words_per_row = rows >> 6; // 64 cells per 64-bit word
+
+    // words_per_row is also a power of two because grid_dimensions is.
+    const unsigned int words_per_row_shift = log2_pow2_u64(words_per_row);
+
+    const auto& cache = get_launch_config_cache();
+    const dim3 block(kWarpSize, kWarpsPerBlock, 1);
+
+    if (words_per_row == kHalfWordsPerRow) {
+        const u64 pair_count = rows >> 1;
+        const unsigned int grid_blocks =
+            choose_grid_blocks(pair_count, cache.sm_count, cache.half_blocks_per_sm);
+
+        game_of_life_kernel_half<<<grid_blocks, block>>>(input, output, rows);
+    } else {
+        const u64 task_count = rows << (words_per_row_shift - kWarpWordShift);
+        const unsigned int grid_blocks =
+            choose_grid_blocks(task_count, cache.sm_count, cache.full_blocks_per_sm);
+
+        game_of_life_kernel_full<<<grid_blocks, block>>>(input, output, rows, words_per_row_shift);
+    }
 }
 
 // The content below was not generated by GPT; it was added to ensure the framework can compile the code.

@@ -1,268 +1,221 @@
-#include <cuda_runtime.h>
+// High-throughput single-step Conway's Game of Life for a square grid stored as
+// 8x8 bit tiles in device memory.
+//
+// Tile-local bit packing assumed by this kernel:
+//   bits  0.. 7 : row 0, columns 0..7
+//   bits  8..15 : row 1, columns 0..7
+//   ...
+//   bits 56..63 : row 7, columns 0..7
+//
+// In other words, bit index = row * 8 + col, the low byte is the tile's top row,
+// and within each byte the LSB is the leftmost cell.
+//
+// Performance-oriented design choices:
+//   - One thread updates one 8x8 tile = 64 cells at once.
+//   - blockDim.x is fixed to one warp, so west/east neighbor tiles are exchanged
+//     with warp shuffles instead of extra global loads.
+//   - Neighbor counts are accumulated with bit-sliced carry-save adders, so all
+//     64 cell counts in the tile are processed in parallel with integer bitwise ops.
+//   - No shared or texture memory: for this access pattern on modern NVIDIA
+//     data-center GPUs, global memory + warp shuffles is simpler and faster.
+
+#include <cstddef>
 #include <cstdint>
+#include <cuda_runtime.h>
 
-/*
- * CUDA implementation of Conway's Game of Life on a square grid.
- *
- * Input/output format:
- * - The logical grid is grid_dimensions x grid_dimensions cells.
- * - Each cell is 0 (dead) or 1 (alive).
- * - On the device, the external API exposes the grid in bit-packed form:
- *     * A std::uint64_t encodes an 8x8 tile of cells.
- *     * Tiles are laid out in row-major order:
- *         tile_index = tile_y * (grid_dimensions / 8) + tile_x
- *       where (tile_x, tile_y) is the tile's coordinate.
- *     * Within a tile, bits are laid out in row-major order:
- *         bit_index = local_y * 8 + local_x
- *       where (local_x, local_y) are coordinates in [0, 7].
- *
- * Implementation strategy:
- * - For simplicity and performance on modern GPUs, the actual
- *   computation of the next generation is done on a dense
- *   1-byte-per-cell representation:
- *     * 0 byte => dead cell
- *     * 1 byte => alive cell
- * - We perform three kernels:
- *     1) unpack_tiles_kernel: bit-packed tiles -> dense byte grid
- *     2) game_of_life_step_kernel: one Game of Life step on the byte grid
- *     3) pack_tiles_kernel: dense byte grid -> bit-packed tiles
- *
- * Notes:
- * - Shared and texture memory are not used, since global memory access
- *   with a well-shaped grid/block configuration is sufficient on H100/A100.
- * - Any data transformation (unpack/pack) overhead is assumed acceptable
- *   per the problem statement.
- * - The caller is responsible for host-device synchronization;
- *   this code does not call cudaDeviceSynchronize.
- */
+namespace {
 
+using u64 = std::uint64_t;
 
-/*
- * Kernel 1: Unpack bit-packed 8x8 tiles into a dense 1-byte-per-cell grid.
- */
-__global__ void unpack_tiles_kernel(const std::uint64_t* __restrict__ input,
-                                    std::uint8_t* __restrict__ dense_grid,
-                                    int grid_dim)
-{
-    const int tiles_per_row = grid_dim / 8;
-    const int num_tiles     = tiles_per_row * tiles_per_row;
+constexpr int kBlockX = 32;      // exactly one warp in X
+constexpr int kBlockY = 8;
+constexpr int kBlockXShift = 5;  // log2(kBlockX)
+constexpr int kBlockYShift = 3;  // log2(kBlockY)
 
-    int tile_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tile_index >= num_tiles) return;
+static_assert(kBlockX == 32, "This kernel assumes blockDim.x == 32.");
+static_assert((1 << kBlockXShift) == kBlockX, "kBlockXShift must match kBlockX.");
+static_assert((1 << kBlockYShift) == kBlockY, "kBlockYShift must match kBlockY.");
 
-    // Determine tile coordinates in the grid of tiles.
-    int tile_y = tile_index / tiles_per_row;
-    int tile_x = tile_index % tiles_per_row;
+constexpr unsigned kFullWarpMask = 0xFFFFFFFFu;
 
-    // Base coordinates of this tile in the cell grid.
-    const int base_x = tile_x * 8;
-    const int base_y = tile_y * 8;
+constexpr u64 kCol0      = 0x0101010101010101ULL;
+constexpr u64 kCol7      = 0x8080808080808080ULL;
+constexpr u64 kNotCol0   = 0xFEFEFEFEFEFEFEFEULL;
+constexpr u64 kNotCol7   = 0x7F7F7F7F7F7F7F7FULL;
+constexpr u64 kByteMask  = 0xFFULL;
+constexpr u64 kByteNoLsb = 0xFEULL;
+constexpr u64 kByteNoMsb = 0x7FULL;
 
-    std::uint64_t word = input[tile_index];
-
-    // Unpack 8x8 cells from the 64-bit word into dense_grid.
-    // bit_index = local_y * 8 + local_x.
-#pragma unroll
-    for (int local_y = 0; local_y < 8; ++local_y) {
-        // Extract the 8 bits for this row as a byte.
-        std::uint8_t row_bits = static_cast<std::uint8_t>(word >> (local_y * 8));
-        const int global_y    = base_y + local_y;
-        const int row_offset  = global_y * grid_dim + base_x;
-
-#pragma unroll
-        for (int local_x = 0; local_x < 8; ++local_x) {
-            std::uint8_t bit = (row_bits >> local_x) & 0x1u;
-            dense_grid[row_offset + local_x] = bit;
-        }
-    }
+// 64-bit shuffle wrappers. Casting through unsigned long long avoids depending on
+// the exact host-side typedef behind std::uint64_t.
+__device__ __forceinline__ u64 shfl_up_u64(u64 v, unsigned delta) {
+    return static_cast<u64>(
+        __shfl_up_sync(kFullWarpMask, static_cast<unsigned long long>(v), delta));
 }
 
-
-/*
- * Kernel 2: Compute one Game of Life step on a dense 1-byte-per-cell grid.
- *
- * - grid_in:  current generation, values 0 or 1
- * - grid_out: next generation,    values 0 or 1
- * - grid_dim: width/height of the square grid
- *
- * Every thread updates exactly one cell.
- *
- * Boundary handling:
- * - Cells outside the grid are logically dead, i.e., neighbor accesses
- *   beyond the border contribute 0.
- * - For performance, interior cells (1 <= x < dim-1, 1 <= y < dim-1)
- *   use a fast path with no bounds checks.
- *   Boundary cells use a separate path with conditionals.
- */
-__global__ void game_of_life_step_kernel(const std::uint8_t* __restrict__ grid_in,
-                                         std::uint8_t* __restrict__ grid_out,
-                                         int grid_dim)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= grid_dim || y >= grid_dim) {
-        return;
-    }
-
-    const int idx = y * grid_dim + x;
-
-    std::uint8_t neighbors = 0;
-
-    // Fast path: interior cells (no boundary checks needed)
-    if (x > 0 && x < grid_dim - 1 && y > 0 && y < grid_dim - 1) {
-        const int row_stride = grid_dim;
-        const std::uint8_t* p = grid_in + idx;
-
-        // Manually unrolled 3x3 neighborhood sum excluding center.
-        neighbors =
-            p[-row_stride - 1] + p[-row_stride] + p[-row_stride + 1] +
-            p[-1]                               + p[+1] +
-            p[+row_stride - 1] + p[+row_stride] + p[+row_stride + 1];
-    } else {
-        // Boundary path: explicitly clamp neighbor accesses to grid bounds.
-        const int dim = grid_dim;
-
-        // Row above
-        if (y > 0) {
-            const int base = (y - 1) * dim;
-            if (x > 0) neighbors += grid_in[base + x - 1];
-            neighbors += grid_in[base + x];
-            if (x + 1 < dim) neighbors += grid_in[base + x + 1];
-        }
-
-        // Same row
-        const int base = y * dim;
-        if (x > 0) neighbors += grid_in[base + x - 1];
-        if (x + 1 < dim) neighbors += grid_in[base + x + 1];
-
-        // Row below
-        if (y + 1 < dim) {
-            const int base2 = (y + 1) * dim;
-            if (x > 0) neighbors += grid_in[base2 + x - 1];
-            neighbors += grid_in[base2 + x];
-            if (x + 1 < dim) neighbors += grid_in[base2 + x + 1];
-        }
-    }
-
-    const std::uint8_t cell = grid_in[idx];
-
-    // Apply Game of Life rules:
-    // - live cell survives iff it has 2 or 3 neighbors
-    // - dead cell becomes alive iff it has exactly 3 neighbors
-    std::uint8_t next_state =
-        (neighbors == 3) | (cell & (neighbors == 2));
-
-    grid_out[idx] = next_state;
+__device__ __forceinline__ u64 shfl_down_u64(u64 v, unsigned delta) {
+    return static_cast<u64>(
+        __shfl_down_sync(kFullWarpMask, static_cast<unsigned long long>(v), delta));
 }
 
-
-/*
- * Kernel 3: Pack a dense 1-byte-per-cell grid back into 8x8 bit-packed tiles.
- */
-__global__ void pack_tiles_kernel(const std::uint8_t* __restrict__ dense_grid,
-                                  std::uint64_t* __restrict__ output,
-                                  int grid_dim)
-{
-    const int tiles_per_row = grid_dim / 8;
-    const int num_tiles     = tiles_per_row * tiles_per_row;
-
-    int tile_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tile_index >= num_tiles) return;
-
-    int tile_y = tile_index / tiles_per_row;
-    int tile_x = tile_index % tiles_per_row;
-
-    const int base_x = tile_x * 8;
-    const int base_y = tile_y * 8;
-
-    std::uint64_t word = 0;
-
-#pragma unroll
-    for (int local_y = 0; local_y < 8; ++local_y) {
-        const int global_y   = base_y + local_y;
-        const int row_offset = global_y * grid_dim + base_x;
-
-#pragma unroll
-        for (int local_x = 0; local_x < 8; ++local_x) {
-            const int idx = row_offset + local_x;
-            std::uint8_t cell = dense_grid[idx] & 0x1u;
-
-            const int bit_index = local_y * 8 + local_x;
-            word |= (static_cast<std::uint64_t>(cell) << bit_index);
-        }
-    }
-
-    output[tile_index] = word;
+// Carry-save adder for bit-sliced popcount.
+// For every bit position i:
+//   sum[i]   = low bit of a[i] + b[i] + c[i]
+//   carry[i] = high bit of a[i] + b[i] + c[i]
+//
+// Because each u64 contains 64 independent one-bit cell values, this is a
+// 64-way parallel 3:2 compressor.
+__device__ __forceinline__ void csa(u64 a, u64 b, u64 c, u64& sum, u64& carry) {
+    const u64 ab_xor = a ^ b;
+    sum   = ab_xor ^ c;
+    carry = (a & b) | (ab_xor & c);
 }
 
+__global__ __launch_bounds__(kBlockX * kBlockY, 2)
+void game_of_life_step_kernel(const u64* __restrict__ input,
+                              u64* __restrict__ output,
+                              int tiles_per_row) {
+    // Each warp covers 32 consecutive tiles on one tile-row; each thread owns one tile.
+    const int x = (static_cast<int>(blockIdx.x) << kBlockXShift) + static_cast<int>(threadIdx.x);
+    const int y = (static_cast<int>(blockIdx.y) << kBlockYShift) + static_cast<int>(threadIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
 
-/*
- * Public API:
- *
- * Execute one step of Conway's Game of Life on a square grid using CUDA.
- *
- * Parameters:
- * - input:  Device pointer to bit-packed input grid.
- * - output: Device pointer to bit-packed output grid.
- * - grid_dimensions: Width/height of the square grid (power of 2).
- *
- * Requirements:
- * - input and output must be allocated with cudaMalloc.
- * - grid_dimensions is a power of 2, > 512, and a multiple of 8.
- *
- * Behavior:
- * - This function:
- *     1) Allocates temporary dense grids on the device.
- *     2) Unpacks the bit-packed input into a dense byte grid.
- *     3) Runs one Game of Life step on the dense grid.
- *     4) Packs the result back into bit-packed tiles in output.
- *     5) Frees the temporary dense grids.
- * - No host-device synchronization (cudaDeviceSynchronize) is performed.
- */
-void run_game_of_life(const std::uint64_t* input,
-                      std::uint64_t* output,
-                      int grid_dimensions)
-{
-    const int dim        = grid_dimensions;
-    const int num_cells  = dim * dim;
-    const int tiles_per_row = dim / 8;
-    const int num_tiles  = tiles_per_row * tiles_per_row;
+    const int last = tiles_per_row - 1;
+    const bool has_north = (y != 0);
+    const bool has_south = (y != last);
 
-    // Allocate temporary dense (1-byte-per-cell) grids on the device.
-    std::uint8_t* d_dense_in  = nullptr;
-    std::uint8_t* d_dense_out = nullptr;
+    const std::size_t row_stride = static_cast<std::size_t>(tiles_per_row);
+    const std::size_t idx =
+        static_cast<std::size_t>(y) * row_stride + static_cast<std::size_t>(x);
 
-    cudaMalloc(&d_dense_in,  static_cast<std::size_t>(num_cells) * sizeof(std::uint8_t));
-    cudaMalloc(&d_dense_out, static_cast<std::size_t>(num_cells) * sizeof(std::uint8_t));
+    // Direct loads: north / center / south tile words.
+    // Missing rows beyond the grid are treated as zero, which exactly implements
+    // the "outside cells are dead" boundary condition.
+    const u64 n = has_north ? input[idx - row_stride] : 0ULL;
+    const u64 c = input[idx];
+    const u64 s = has_south ? input[idx + row_stride] : 0ULL;
 
-    // 1) Unpack bit-packed tiles to dense grid.
-    {
-        const int threads_per_block = 256;
-        const int blocks = (num_tiles + threads_per_block - 1) / threads_per_block;
-        unpack_tiles_kernel<<<blocks, threads_per_block>>>(input, d_dense_in, dim);
+    // West/east neighbor tiles are usually supplied by the adjacent lane in the warp.
+    u64 w  = shfl_up_u64(c, 1);
+    u64 e  = shfl_down_u64(c, 1);
+    u64 nw = shfl_up_u64(n, 1);
+    u64 ne = shfl_down_u64(n, 1);
+    u64 sw = shfl_up_u64(s, 1);
+    u64 se = shfl_down_u64(s, 1);
+
+    // Shuffle exchange does not cross warp boundaries, so only lane 0 / lane 31
+    // need explicit global loads. That keeps average memory traffic per tile low.
+    if (lane == 0) {
+        const bool has_west = (x != 0);
+        w  = has_west ? input[idx - 1] : 0ULL;
+        nw = (has_west && has_north) ? input[idx - row_stride - 1] : 0ULL;
+        sw = (has_west && has_south) ? input[idx + row_stride - 1] : 0ULL;
     }
 
-    // 2) Run one Game of Life step on dense grid.
-    {
-        // Use a 2D launch configuration that favors coalesced accesses.
-        dim3 block_dim(32, 8);  // 256 threads per block
-        dim3 grid_dim_2d((dim + block_dim.x - 1) / block_dim.x,
-                         (dim + block_dim.y - 1) / block_dim.y);
-
-        game_of_life_step_kernel<<<grid_dim_2d, block_dim>>>(d_dense_in, d_dense_out, dim);
+    if (lane == kBlockX - 1) {
+        const bool has_east = (x != last);
+        e  = has_east ? input[idx + 1] : 0ULL;
+        ne = (has_east && has_north) ? input[idx - row_stride + 1] : 0ULL;
+        se = (has_east && has_south) ? input[idx + row_stride + 1] : 0ULL;
     }
 
-    // 3) Pack dense grid back into bit-packed tiles.
-    {
-        const int threads_per_block = 256;
-        const int blocks = (num_tiles + threads_per_block - 1) / threads_per_block;
-        pack_tiles_kernel<<<blocks, threads_per_block>>>(d_dense_out, output, dim);
-    }
+    // Pre-extract the only parts of neighbor tiles needed for cross-tile alignment.
+    const u64 c_no_col7 = c & kNotCol7;
+    const u64 c_no_col0 = c & kNotCol0;
+    const u64 n_row7    = n >> 56;          // north tile row 7 moved into low byte
+    const u64 s_row0    = s & kByteMask;    // south tile row 0
+    const u64 w_col7    = w & kCol7;        // west tile column 7 in-place
+    const u64 e_col0    = e & kCol0;        // east tile column 0 in-place
 
-    // Free temporary dense grids.
-    cudaFree(d_dense_in);
-    cudaFree(d_dense_out);
+    // Build aligned neighbor bitboards. Each bit position now refers to the same
+    // cell position inside the current tile.
+    const u64 north_bits = (c << 8) | n_row7;
+    const u64 south_bits = (c >> 8) | (s_row0 << 56);
+    const u64 west_bits  = (c_no_col7 << 1) | (w_col7 >> 7);
+
+    u64 ones_a, twos_a;
+    csa(north_bits, south_bits, west_bits, ones_a, twos_a);
+
+    const u64 east_bits =
+        (c_no_col0 >> 1) | (e_col0 << 7);
+
+    const u64 northwest_bits =
+        (c_no_col7 << 9) |
+        ((n_row7 & kByteNoMsb) << 1) |
+        (w_col7 << 1) |
+        (nw >> 63);
+
+    const u64 northeast_bits =
+        (c_no_col0 << 7) |
+        ((n_row7 & kByteNoLsb) >> 1) |
+        (e_col0 << 15) |
+        (((ne >> 56) & 0x1ULL) << 7);
+
+    u64 ones_b, twos_b;
+    csa(east_bits, northwest_bits, northeast_bits, ones_b, twos_b);
+
+    const u64 southwest_bits =
+        (c_no_col7 >> 7) |
+        ((s_row0 & kByteNoMsb) << 57) |
+        (w_col7 >> 15) |
+        (((sw >> 7) & 0x1ULL) << 56);
+
+    const u64 southeast_bits =
+        (c_no_col0 >> 9) |
+        ((s_row0 & kByteNoLsb) << 55) |
+        (e_col0 >> 1) |
+        ((se & 0x1ULL) << 63);
+
+    const u64 ones_c = southwest_bits ^ southeast_bits;
+    const u64 twos_c = southwest_bits & southeast_bits;
+
+    // Bit-sliced popcount of the eight neighbors.
+    u64 ones, twos_d;
+    csa(ones_a, ones_b, ones_c, ones, twos_d);
+
+    u64 twos_e, fours_a;
+    csa(twos_a, twos_b, twos_c, twos_e, fours_a);
+
+    // Let count = ones + 2*K, where K = twos_a + twos_b + twos_c + twos_d.
+    // Counts 2 and 3 are exactly the cases K == 1.
+    //
+    // twos_e ^ twos_d is parity(K).
+    // fours_a is already 1 whenever K >= 3.
+    // The remaining K != 1 case is K == 2, and parity(K) is then 0.
+    // Therefore:
+    //   ((twos_e ^ twos_d) & ~fours_a)  <=>  neighbor count is 2 or 3.
+    const u64 count_2_or_3 = (twos_e ^ twos_d) & ~fours_a;
+
+    // Final Life rule:
+    //   count == 2 -> survive iff currently alive
+    //   count == 3 -> alive regardless of current state
+    //
+    // Under count_2_or_3:
+    //   count == 2 => ones == 0, so (ones | c) == c
+    //   count == 3 => ones == 1, so (ones | c) == 1
+    output[idx] = count_2_or_3 & (ones | c);
+}
+
+}  // namespace
+
+void run_game_of_life(const std::uint64_t* input, std::uint64_t* output, int grid_dimensions) {
+    // Out-of-place update: input and output are expected to be different device buffers.
+    //
+    // One 64-bit word stores one 8x8 tile, so the tile grid is (N/8) x (N/8).
+    // The problem contract guarantees N is a power of 2 and N > 512, therefore:
+    //   tiles_per_row = N / 8
+    // is also a power of 2, and is divisible by both 32 and 8. That lets us launch
+    // an exact grid without a per-thread x/y bounds check in the kernel body.
+    const int tiles_per_row = grid_dimensions >> 3;
+
+    const dim3 block(kBlockX, kBlockY, 1);
+    const dim3 grid(static_cast<unsigned int>(tiles_per_row >> kBlockXShift),
+                    static_cast<unsigned int>(tiles_per_row >> kBlockYShift),
+                    1);
+
+    // Caller controls synchronization and error handling policy; this function only
+    // enqueues a single asynchronous kernel launch on the default stream.
+    game_of_life_step_kernel<<<grid, block>>>(input, output, tiles_per_row);
 }
 
 // The content below was not generated by GPT; it was added to ensure the framework can compile the code.

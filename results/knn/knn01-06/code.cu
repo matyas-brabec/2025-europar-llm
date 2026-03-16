@@ -1,273 +1,296 @@
 #include <cuda_runtime.h>
+#include <cub/block/block_radix_sort.cuh>
+
+#include <climits>
+#include <cstddef>
 #include <utility>
-#include <cfloat>
 
-// -------------------------------------------------------------------------------------------------
-// Optimized brute-force k-NN for 2D points on modern NVIDIA GPUs (A100 / H100).
+namespace {
+
+// Targeted for modern data-center GPUs (A100/H100 class).
 //
-// - Each CUDA thread processes one query point.
-// - All threads in a block cooperatively load tiles of the data points into shared memory.
-// - Each thread scans all data points, computing distances to its query.
-// - For each query, a per-thread max-heap of size K (K = k) is maintained in local memory,
-//   holding the current k nearest neighbors (smallest distances).
-// - To insert a candidate distance d:
-//     * If we haven't filled the heap yet, we append it.
-//     * Once we have K elements, we build an initial max-heap.
-//     * Afterwards, for each new distance d, if d < heap[0] (the current worst among the k best),
-//       we replace the root and sift-down to restore max-heap property.
-// - After scanning all data points, we perform an in-place heap sort on the per-thread heap,
-//   which converts the max-heap into an array sorted by ascending distance.
-// - The sorted (index, distance) pairs are written to the result array as std::pair<int,float>.
+// Hyper-parameter choice:
+// - One CTA owns one query. With the "no extra device memory" constraint, this is the
+//   simplest exact strategy because the entire per-query top-k state stays on chip.
+// - 256 threads/CTA is the sweet spot here:
+//     * fully coalesced 256-point streaming tiles from the data set,
+//     * good occupancy on A100/H100,
+//     * and, because k <= 1024, the persistent top-k state is at most 4 pairs/thread.
 //
-// Design notes:
-//   * Complexity per query: O(N log K) distance candidates with extremely cheap log K (~10) for K<=1024.
-//   * k is a power of two between 32 and 1024 inclusive; we use template specialization on K
-//     for best performance and to allow fixed-size arrays.
-//   * We only allocate shared memory for a tile of data points; no extra global memory is allocated.
-//   * Local thread heaps are stored in thread-local memory (which may spill to global and be cached).
-//   * Block size and tile size are chosen to provide good occupancy and memory reuse.
-// -------------------------------------------------------------------------------------------------
-
-// Tune these for the target GPU if needed.
-#ifndef KNN_BLOCK_DIM
-#define KNN_BLOCK_DIM 128    // threads per block (queries processed per block)
-#endif
-
-#ifndef KNN_TILE_DATA
-#define KNN_TILE_DATA 256    // number of data points loaded per tile into shared memory
-#endif
-
-// -------------------------------------------------------------------------------------------------
-// Device helper: sift-down operation for a max-heap stored in flat arrays.
+// Core idea:
+// - Maintain the current exact top-k in a *striped* register layout across the CTA:
+//     thread t owns ranks t, t + 256, t + 512, ...
+// - On an update, append one new candidate per thread and radix-sort the combined set
+//   with CUB, again asking for striped output.
+// - In striped output, the last "stripe" is exactly the largest 256 items, so discarding
+//   it leaves the smallest k items already laid out correctly for the next iteration.
+// - For k < 256, extra lanes are simply padded with +inf sentinels.
 //
-// heap_dist, heap_idx : arrays of length >= heap_size
-// idx                 : index to start sifting down from (usually 0)
-// heap_size           : number of elements in the heap [0, heap_size)
-// -------------------------------------------------------------------------------------------------
-template<int K>
-__device__ __forceinline__
-void heap_sift_down(float (&heap_dist)[K], int (&heap_idx)[K], int idx, int heap_size)
-{
-    while (true) {
-        int left  = (idx << 1) + 1;  // left child
-        if (left >= heap_size) {
-            break; // no children
-        }
-        int right = left + 1;        // right child
+// To get a tighter initial kth-distance threshold, we bootstrap from as many points as the
+// update machinery can absorb in one shot: (TOP_ITEMS + 1) * 256 points. This is exact,
+// costs no extra global-memory traffic, and often removes an otherwise inevitable early update.
 
-        int   largest    = idx;
-        float largestVal = heap_dist[idx];
+constexpr int kBlockThreads = 256;
+using ResultPair = std::pair<int, float>;
 
-        float leftVal = heap_dist[left];
-        if (leftVal > largestVal) {
-            largest    = left;
-            largestVal = leftVal;
-        }
+template <int K>
+struct KnnTraits {
+    static_assert(K >= 32 && K <= 1024 && (K & (K - 1)) == 0,
+                  "k must be a power of two in [32, 1024].");
 
-        if (right < heap_size) {
-            float rightVal = heap_dist[right];
-            if (rightVal > largestVal) {
-                largest    = right;
-                largestVal = rightVal;
+    static constexpr int TOP_ITEMS    = (K + kBlockThreads - 1) / kBlockThreads;  // 1, 2, or 4
+    static constexpr int UPDATE_ITEMS = TOP_ITEMS + 1;                             // 2, 3, or 5
+    static constexpr int INIT_CAPACITY = UPDATE_ITEMS * kBlockThreads;             // 512, 768, 1280
+    static constexpr bool NEED_MASK   = (K < kBlockThreads);
+
+    // In striped layout, rank r lives in:
+    //   thread = r % 256
+    //   item   = r / 256
+    static constexpr int KTH_THREAD = (K - 1) % kBlockThreads;
+    static constexpr int KTH_ITEM   = (K - 1) / kBlockThreads;
+
+    static_assert(TOP_ITEMS >= 1 && TOP_ITEMS <= 4, "Unexpected TOP_ITEMS.");
+    static_assert(UPDATE_ITEMS >= 2 && UPDATE_ITEMS <= 5, "Unexpected UPDATE_ITEMS.");
+    static_assert(KTH_ITEM < TOP_ITEMS, "Invalid kth element location.");
+
+    using UpdateSort = cub::BlockRadixSort<float, kBlockThreads, UPDATE_ITEMS, int>;
+    using TempStorage = typename UpdateSort::TempStorage;
+};
+
+__device__ __forceinline__ float squared_l2(const float qx, const float qy, const float2 p) {
+    // Squared Euclidean distance. No sqrt is taken because the interface asks for the
+    // squared L2 norm directly.
+    const float dx = qx - p.x;
+    const float dy = qy - p.y;
+    return fmaf(dx, dx, dy * dy);
+}
+
+template <int K>
+static __global__ __launch_bounds__(256)
+void knn_kernel(const float2* __restrict__ query,
+                const float2* __restrict__ data,
+                int data_count,
+                ResultPair* __restrict__ result) {
+    using Traits = KnnTraits<K>;
+    using UpdateSort = typename Traits::UpdateSort;
+
+    constexpr int TOP_ITEMS     = Traits::TOP_ITEMS;
+    constexpr int UPDATE_ITEMS  = Traits::UPDATE_ITEMS;
+    constexpr int INIT_CAPACITY = Traits::INIT_CAPACITY;
+    constexpr bool NEED_MASK    = Traits::NEED_MASK;
+    constexpr int KTH_THREAD    = Traits::KTH_THREAD;
+    constexpr int KTH_ITEM      = Traits::KTH_ITEM;
+
+    __shared__ typename Traits::TempStorage sort_storage;
+    __shared__ float shared_tau;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int qid = static_cast<int>(blockIdx.x);
+
+    // The query is tiny and reused for the full scan; keeping it in registers is ideal.
+    const float2 q = query[qid];
+    const float qx = q.x;
+    const float qy = q.y;
+
+    const float inf = CUDART_INF_F;
+    const int invalid_index = INT_MAX;
+
+    // Persistent exact top-k state for this thread, stored in striped layout.
+    float top_keys[TOP_ITEMS];
+    int   top_vals[TOP_ITEMS];
+
+    // -------------------------------------------------------------------------
+    // Bootstrap:
+    // Sort the largest batch that the regular update path can consume in one shot.
+    // This gives a much tighter initial threshold than starting from only the first k
+    // elements and uses the same per-thread state size as every later update.
+    // -------------------------------------------------------------------------
+    const int init_points = (data_count < INIT_CAPACITY) ? data_count : INIT_CAPACITY;
+
+    {
+        float init_keys[UPDATE_ITEMS];
+        int   init_vals[UPDATE_ITEMS];
+
+        #pragma unroll
+        for (int i = 0; i < UPDATE_ITEMS; ++i) {
+            const int data_idx = tid + i * kBlockThreads;
+            if (data_idx < init_points) {
+                const float2 p = data[data_idx];
+                init_keys[i] = squared_l2(qx, qy, p);
+                init_vals[i] = data_idx;
+            } else {
+                init_keys[i] = inf;
+                init_vals[i] = invalid_index;
             }
         }
 
-        if (largest == idx) {
-            break; // heap property satisfied
+        // Global sort of the bootstrap batch, with striped output.
+        UpdateSort(sort_storage).SortBlockedToStriped(init_keys, init_vals);
+
+        // Keep only the smallest k entries; for k < 256, only the first k lanes of the
+        // first stripe are valid and the rest are masked back to +inf.
+        #pragma unroll
+        for (int i = 0; i < TOP_ITEMS; ++i) {
+            if constexpr (NEED_MASK) {
+                const int striped_rank = tid + i * kBlockThreads;
+                if (striped_rank < K) {
+                    top_keys[i] = init_keys[i];
+                    top_vals[i] = init_vals[i];
+                } else {
+                    top_keys[i] = inf;
+                    top_vals[i] = invalid_index;
+                }
+            } else {
+                top_keys[i] = init_keys[i];
+                top_vals[i] = init_vals[i];
+            }
         }
 
-        // Swap current node with the largest child
-        float tmpd          = heap_dist[idx];
-        heap_dist[idx]      = heap_dist[largest];
-        heap_dist[largest]  = tmpd;
-
-        int tmpi            = heap_idx[idx];
-        heap_idx[idx]       = heap_idx[largest];
-        heap_idx[largest]   = tmpi;
-
-        idx = largest;
-    }
-}
-
-// -------------------------------------------------------------------------------------------------
-// Device kernel: brute-force k-NN for 2D points with per-thread max-heap.
-// Template parameters:
-//   K    : number of neighbors to keep (k)
-//   TILE : tile size for shared-memory loads of data points
-//
-// Each thread processes a single query point.
-// -------------------------------------------------------------------------------------------------
-template<int K, int TILE>
-__global__
-void knn_kernel_2d(const float2* __restrict__ query,
-                   int                 query_count,
-                   const float2* __restrict__ data,
-                   int                 data_count,
-                   std::pair<int, float>* __restrict__ result)
-{
-    // Shared memory tile for data points
-    __shared__ float2 sh_data[TILE];
-
-    const int tid       = threadIdx.x;
-    const int q_global  = blockIdx.x * blockDim.x + tid;
-    const bool valid    = (q_global < query_count);
-
-    // Load query point into a register for faster access
-    float2 q;
-    if (valid) {
-        q = query[q_global];
-    }
-
-    // Per-thread heap storage: distances and corresponding data indices.
-    // We maintain a max-heap of size K.
-    float heap_dist[K];
-    int   heap_idx[K];
-    int   filled = 0;          // number of elements currently in heap (up to K)
-    bool  heap_built = false;  // whether we've built the initial max-heap
-
-    // Loop over data points in tiles
-    for (int base = 0; base < data_count; base += TILE) {
-        int tile_size = data_count - base;
-        if (tile_size > TILE) tile_size = TILE;
-
-        // Cooperative load of data tile into shared memory.
-        for (int i = tid; i < tile_size; i += blockDim.x) {
-            sh_data[i] = data[base + i];
+        if (tid == KTH_THREAD) {
+            shared_tau = top_keys[KTH_ITEM];
         }
 
+        // This barrier serves both purposes:
+        // 1) makes shared_tau visible to the whole CTA;
+        // 2) satisfies CUB's requirement before reusing TempStorage.
         __syncthreads();
+    }
 
-        if (valid) {
-            // Process this tile for the current query
-            for (int i = 0; i < tile_size; ++i) {
-                int global_idx = base + i;
+    float tau = shared_tau;
 
-                float dx = q.x - sh_data[i].x;
-                float dy = q.y - sh_data[i].y;
-                float dist = dx * dx + dy * dy;  // squared Euclidean distance
+    // -------------------------------------------------------------------------
+    // Stream the rest of the data in 256-point tiles.
+    // We only invoke the expensive block-wide sort if at least one point in the tile
+    // beats the current kth distance. Using strict '< tau' is intentional:
+    // - ties may be resolved arbitrarily per the problem statement,
+    // - and avoiding '<=' reduces needless update sorts on boundary ties.
+    // -------------------------------------------------------------------------
+    for (int base = init_points; base < data_count; base += kBlockThreads) {
+        const int data_idx = base + tid;
 
-                if (filled < K) {
-                    // Still filling initial buffer; no heap property needed yet.
-                    heap_dist[filled] = dist;
-                    heap_idx[filled]  = global_idx;
-                    ++filled;
+        float cand_key = inf;
+        int   cand_val = invalid_index;
+        bool  candidate = false;
 
-                    // Once we have K elements, build the initial max-heap.
-                    if (filled == K) {
-                        for (int j = (K / 2) - 1; j >= 0; --j) {
-                            heap_sift_down<K>(heap_dist, heap_idx, j, K);
-                        }
-                        heap_built = true;
+        if (data_idx < data_count) {
+            const float2 p = data[data_idx];
+            const float dist = squared_l2(qx, qy, p);
+            candidate = (dist < tau);
+            if (candidate) {
+                cand_key = dist;
+                cand_val = data_idx;
+            }
+        }
+
+        // Block-uniform branch: every thread gets the same result.
+        const int any_update = __syncthreads_or(candidate);
+
+        if (any_update) {
+            float work_keys[UPDATE_ITEMS];
+            int   work_vals[UPDATE_ITEMS];
+
+            // Existing top-k + this thread's new candidate.
+            #pragma unroll
+            for (int i = 0; i < TOP_ITEMS; ++i) {
+                work_keys[i] = top_keys[i];
+                work_vals[i] = top_vals[i];
+            }
+            work_keys[TOP_ITEMS] = cand_key;
+            work_vals[TOP_ITEMS] = cand_val;
+
+            // Sort K + 256 logical items (plus +inf padding when k < 256).
+            // In striped output, dropping the last stripe is exactly equivalent to
+            // removing the 256 largest elements.
+            UpdateSort(sort_storage).SortBlockedToStriped(work_keys, work_vals);
+
+            #pragma unroll
+            for (int i = 0; i < TOP_ITEMS; ++i) {
+                if constexpr (NEED_MASK) {
+                    const int striped_rank = tid + i * kBlockThreads;
+                    if (striped_rank < K) {
+                        top_keys[i] = work_keys[i];
+                        top_vals[i] = work_vals[i];
+                    } else {
+                        top_keys[i] = inf;
+                        top_vals[i] = invalid_index;
                     }
                 } else {
-                    // Heap already built and full: potential replacement of max element.
-                    // For a max-heap, root (index 0) holds the current worst (largest distance)
-                    // among the K best; only replace it if this candidate is better (smaller).
-                    if (dist < heap_dist[0]) {
-                        heap_dist[0] = dist;
-                        heap_idx[0]  = global_idx;
-                        heap_sift_down<K>(heap_dist, heap_idx, 0, K);
-                    }
+                    top_keys[i] = work_keys[i];
+                    top_vals[i] = work_vals[i];
                 }
             }
+
+            if (tid == KTH_THREAD) {
+                shared_tau = top_keys[KTH_ITEM];
+            }
+
+            // Visible tau update + legal CUB TempStorage reuse barrier.
+            __syncthreads();
+            tau = shared_tau;
         }
-
-        __syncthreads();
     }
 
-    if (!valid) {
-        return;
-    }
+    // -------------------------------------------------------------------------
+    // Write back the final exact top-k for this query.
+    // The internal representation is already globally sorted in striped order:
+    //   rank = tid + item * 256
+    // -------------------------------------------------------------------------
+    ResultPair* const out =
+        result + static_cast<size_t>(qid) * static_cast<size_t>(K);
 
-    // At this point, we must have at least K elements (data_count >= K by assumption).
-    // If for some reason heap_built is still false (e.g., data_count == K),
-    // we build the heap now.
-    if (!heap_built) {
-        // filled should equal K here, but we guard against pathological cases.
-        int heap_size = (filled < K) ? filled : K;
-        for (int j = (heap_size / 2) - 1; j >= 0; --j) {
-            heap_sift_down<K>(heap_dist, heap_idx, j, heap_size);
+    #pragma unroll
+    for (int i = 0; i < TOP_ITEMS; ++i) {
+        const int rank = tid + i * kBlockThreads;
+
+        if constexpr (NEED_MASK) {
+            if (rank < K) {
+                out[rank].first  = top_vals[i];
+                out[rank].second = top_keys[i];
+            }
+        } else {
+            out[rank].first  = top_vals[i];
+            out[rank].second = top_keys[i];
         }
-        heap_built = true;
-    }
-
-    // In-place heap sort of the max-heap.
-    // After this, heap_dist/heap_idx will be sorted in ascending order of distance.
-    for (int end = K - 1; end > 0; --end) {
-        // Swap root (largest) with last element in current heap
-        float tmpd         = heap_dist[0];
-        heap_dist[0]       = heap_dist[end];
-        heap_dist[end]     = tmpd;
-
-        int tmpi           = heap_idx[0];
-        heap_idx[0]        = heap_idx[end];
-        heap_idx[end]      = tmpi;
-
-        // Restore heap property on the reduced heap [0, end)
-        heap_sift_down<K>(heap_dist, heap_idx, 0, end);
-    }
-
-    // Write out sorted results for this query.
-    // result[q * K + j] = j-th nearest neighbor for this query.
-    int result_base = q_global * K;
-    for (int i = 0; i < K; ++i) {
-        result[result_base + i].first  = heap_idx[i];
-        result[result_base + i].second = heap_dist[i];
     }
 }
 
-// -------------------------------------------------------------------------------------------------
-// Host interface:
-//
-// void run_knn(const float2 *query, int query_count,
-//              const float2 *data,  int data_count,
-//              std::pair<int, float> *result, int k);
-//
-// query, data, result are device pointers allocated via cudaMalloc.
-// k is a power of two between 32 and 1024 inclusive.
-// -------------------------------------------------------------------------------------------------
-void run_knn(const float2 *query,
-             int           query_count,
-             const float2 *data,
-             int           data_count,
-             std::pair<int, float> *result,
-             int           k)
-{
-    if (query_count <= 0 || data_count <= 0 || k <= 0) {
+template <int K>
+inline void launch_knn_specialized(const float2* query,
+                                   int query_count,
+                                   const float2* data,
+                                   int data_count,
+                                   ResultPair* result) {
+    const dim3 grid(static_cast<unsigned int>(query_count));
+    const dim3 block(kBlockThreads);
+
+    // Intentionally asynchronous: enqueue on the current default stream.
+    knn_kernel<K><<<grid, block>>>(query, data, data_count, result);
+}
+
+}  // namespace
+
+void run_knn(const float2* query,
+             int query_count,
+             const float2* data,
+             int data_count,
+             std::pair<int, float>* result,
+             int k) {
+    if (query_count <= 0) {
         return;
     }
 
-    const int block_dim = KNN_BLOCK_DIM;
-    dim3 block(block_dim);
-    dim3 grid((query_count + block_dim - 1) / block_dim);
-
-    // Dispatch to a specialized kernel based on k.
-    // k is guaranteed to be a power of two between 32 and 1024 inclusive.
+    // Runtime dispatch over the only legal k values. This keeps all of the important
+    // quantities (state size, loop trip counts, radix-sort arity, kth register location)
+    // compile-time constants in the actual kernel.
     switch (k) {
-        case 32:
-            knn_kernel_2d<32, KNN_TILE_DATA><<<grid, block>>>(query, query_count, data, data_count, result);
-            break;
-        case 64:
-            knn_kernel_2d<64, KNN_TILE_DATA><<<grid, block>>>(query, query_count, data, data_count, result);
-            break;
-        case 128:
-            knn_kernel_2d<128, KNN_TILE_DATA><<<grid, block>>>(query, query_count, data, data_count, result);
-            break;
-        case 256:
-            knn_kernel_2d<256, KNN_TILE_DATA><<<grid, block>>>(query, query_count, data, data_count, result);
-            break;
-        case 512:
-            knn_kernel_2d<512, KNN_TILE_DATA><<<grid, block>>>(query, query_count, data, data_count, result);
-            break;
-        case 1024:
-            knn_kernel_2d<1024, KNN_TILE_DATA><<<grid, block>>>(query, query_count, data, data_count, result);
-            break;
+        case 32:   launch_knn_specialized<32>(query, query_count, data, data_count, result);   return;
+        case 64:   launch_knn_specialized<64>(query, query_count, data, data_count, result);   return;
+        case 128:  launch_knn_specialized<128>(query, query_count, data, data_count, result);  return;
+        case 256:  launch_knn_specialized<256>(query, query_count, data, data_count, result);  return;
+        case 512:  launch_knn_specialized<512>(query, query_count, data, data_count, result);  return;
+        case 1024: launch_knn_specialized<1024>(query, query_count, data, data_count, result); return;
         default:
-            // k is assumed valid by problem constraints; no fallback implemented.
-            break;
+            // Input validity guarantees this path is unreachable.
+            return;
     }
-
-    // Optionally, the caller can synchronize and check for errors here:
-    // cudaDeviceSynchronize();
-    // cudaGetLastError();
 }

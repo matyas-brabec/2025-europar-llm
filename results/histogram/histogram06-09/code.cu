@@ -1,175 +1,178 @@
 #include <cuda_runtime.h>
 
+namespace {
+
+// One histogram replica per warp lane / shared-memory bank.
+constexpr int kWarpLanes = 32;
+constexpr int kHistogramReplicas = 32;
+
+// 256 threads = 8 warps per block. This is a good fit for A100/H100-class GPUs while
+// keeping the worst-case shared-memory footprint (256 bins * 32 replicas * 4 B = 32 KiB)
+// low enough to allow multiple resident blocks per SM.
+constexpr int kBlockSize = 256;
+constexpr int kWarpsPerBlock = kBlockSize / kWarpLanes;
+
+// Large-input default for modern NVIDIA GPUs: enough work per thread to amortize shared
+// histogram setup/finalization, while still keeping the loop compact and fully unrollable.
+constexpr int itemsPerThread = 16;
+constexpr unsigned int kBlockWork = kBlockSize * itemsPerThread;
+
+// This kernel has non-trivial per-block overhead (shared histogram zeroing + final reduction).
+// Around 32 active warps/SM is typically enough on recent data-center GPUs, so we cap the
+// launch at 4 blocks/SM rather than blindly launching every possible resident block.
+constexpr int kTargetResidentBlocksPerSM = 4;
+
+static_assert(kWarpLanes == 32, "This kernel relies on NVIDIA's 32-lane warp size.");
+static_assert(kHistogramReplicas == kWarpLanes, "Use one replica per warp lane.");
+static_assert((kBlockSize % kWarpLanes) == 0, "Block size must be a multiple of warp size.");
+static_assert(itemsPerThread > 0, "itemsPerThread must be positive.");
+
+__device__ __forceinline__ unsigned int warp_reduce_sum(unsigned int value) {
+    #pragma unroll
+    for (int offset = kWarpLanes / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
 /*
- * CUDA histogram kernel optimized for modern NVIDIA GPUs (A100/H100).
- *
- * Features:
- *  - Range-restricted histogram (characters in [from, to]).
- *  - Uses shared memory privatization to reduce global atomic contention.
- *  - 32 warp-lane-private copies of the histogram in shared memory.
- *  - Layout and stride chosen to avoid shared-memory bank conflicts.
- *  - Each thread processes ITEMS_PER_THREAD input bytes to increase ILP.
- */
+  Shared-memory layout:
+      s_hist[bin * 32 + replica]
 
-constexpr int WARP_SIZE         = 32;
-constexpr int ITEMS_PER_THREAD  = 8;  // Tunable; 8 is a good default for large inputs on modern GPUs
+  For 32-bit words, the shared-memory bank is (word_index % 32). With the above layout,
+  replica r of every bin always maps to bank r. Threads use replica == lane, so within a warp
+  every lane touches a distinct bank regardless of which bin it increments:
+      bank(bin * 32 + lane) == lane
 
-
-/**
- * Histogram kernel.
- *
- * @tparam ITEMS_PER_THREAD_T  Number of input items processed per thread.
- *
- * @param input      Device pointer to input characters.
- * @param histogram  Device pointer to output histogram (size = numBins).
- * @param inputSize  Number of characters in input.
- * @param from       Lower bound of character range (inclusive).
- * @param numBins    Number of histogram bins (to - from + 1).
- * @param stride     Stride between per-lane histogram copies in shared memory.
- *                   Must be >= numBins and odd to avoid bank conflicts.
- */
-template <int ITEMS_PER_THREAD_T>
-__global__ void histogram_kernel(const char* __restrict__ input,
-                                 unsigned int* __restrict__ histogram,
-                                 unsigned int inputSize,
-                                 int from,
-                                 int numBins,
-                                 int stride)
-{
-    // Shared memory layout:
-    //   s_hist[warp_lane * stride + bin]
-    //
-    // There are WARP_SIZE copies of the histogram, each of length "stride".
-    // For a given bin 'b' and lane 'l':
-    //   index = l * stride + b
-    // Bank index = (index) % 32 (since sizeof(unsigned int) == 4 bytes).
-    // With stride odd, gcd(stride, 32) == 1, so as l goes 0..31, banks are all distinct.
+  This is the requested 32-copy histogram privatization scheme:
+    - 32 total copies of the histogram per thread block
+    - each copy is associated with one warp lane / one bank
+    - updates are bank-conflict-free within a warp
+    - reduction is also bank-conflict-free by having a warp read all 32 replicas of one bin
+*/
+__global__ __launch_bounds__(kBlockSize)
+void histogram_range_kernel(const char* __restrict__ input,
+                            unsigned int* __restrict__ histogram,
+                            unsigned int inputSize,
+                            unsigned int from,
+                            unsigned int rangeSize) {
     extern __shared__ unsigned int s_hist[];
 
-    const int tid       = threadIdx.x;
-    const int blockSize = blockDim.x;
-    const int laneId    = tid & (WARP_SIZE - 1); // threadIdx.x % 32
+    const unsigned int tid    = threadIdx.x;
+    const unsigned int lane   = tid & (kWarpLanes - 1u);
+    const unsigned int warpId = tid >> 5;
 
-    const int histCopies = WARP_SIZE;
-    const int sharedSize = histCopies * stride;
+    const unsigned int replicatedBins = rangeSize * kHistogramReplicas;
 
-    // Initialize shared histogram copies to zero.
-    for (int i = tid; i < sharedSize; i += blockSize)
-    {
+    // Zero the block-private histogram. Dynamic shared memory keeps the footprint proportional
+    // to the requested [from, to] range instead of always reserving the full 256-bin table.
+    for (unsigned int i = tid; i < replicatedBins; i += kBlockSize) {
         s_hist[i] = 0u;
     }
     __syncthreads();
 
-    // Each block processes a contiguous chunk of the input:
-    //   blockChunkSize = blockDim.x * ITEMS_PER_THREAD_T
-    // Each thread processes ITEMS_PER_THREAD_T items spaced by blockDim.x.
-    const unsigned int blockChunkSize = blockSize * ITEMS_PER_THREAD_T;
-    unsigned int baseIndex = blockIdx.x * blockChunkSize + tid;
+    // Process the input in a blocked, fully coalesced pattern:
+    // on each inner-loop iteration, threads in the block load a contiguous kBlockSize-byte span.
+    // 64-bit index arithmetic is used so the code remains correct up to the full 4 GiB inputSize limit.
+    const size_t n          = static_cast<size_t>(inputSize);
+    const size_t blockWork  = static_cast<size_t>(kBlockWork);
+    const size_t base0      = static_cast<size_t>(blockIdx.x) * blockWork + static_cast<size_t>(tid);
+    const size_t gridStride = static_cast<size_t>(gridDim.x) * blockWork;
 
-    for (int item = 0; item < ITEMS_PER_THREAD_T; ++item)
-    {
-        unsigned int dataIndex = baseIndex + static_cast<unsigned int>(item) * blockSize;
-        if (dataIndex >= inputSize)
-            break;
+    for (size_t base = base0; base < n; base += gridStride) {
+        #pragma unroll
+        for (int i = 0; i < itemsPerThread; ++i) {
+            const size_t idx = base + static_cast<size_t>(i) * kBlockSize;
+            if (idx < n) {
+                // Cast through unsigned char so byte values 128..255 are handled correctly even
+                // when plain char is signed.
+                const unsigned int c = static_cast<unsigned char>(input[idx]);
 
-        unsigned char c = static_cast<unsigned char>(input[dataIndex]);
-        int val = static_cast<int>(c);
-
-        // Compute bin index relative to 'from'.
-        int bin = val - from;
-
-        // Fast range check: equivalent to (val >= from && val < from + numBins)
-        if (static_cast<unsigned int>(bin) < static_cast<unsigned int>(numBins))
-        {
-            // Per-lane histogram copy to avoid intra-warp bank conflicts and atomics to same address.
-            unsigned int* binPtr = &s_hist[laneId * stride + bin];
-            atomicAdd(binPtr, 1u);
+                // Single unsigned range test:
+                //   bin = c - from
+                //   bin < rangeSize  <=>  from <= c <= to
+                const unsigned int bin = c - from;
+                if (bin < rangeSize) {
+                    atomicAdd(&s_hist[bin * kHistogramReplicas + lane], 1u);
+                }
+            }
         }
     }
-
     __syncthreads();
 
-    // Reduce 32 per-lane copies into global histogram.
-    // Each thread handles multiple bins (strided by blockDim.x).
-    for (int bin = tid; bin < numBins; bin += blockSize)
-    {
-        unsigned int sum = 0;
-        for (int copy = 0; copy < histCopies; ++copy)
-        {
-            sum += s_hist[copy * stride + bin];
-        }
+    // Reduce the 32 lane-private replicas. One warp reduces one bin at a time so lane r reads
+    // replica r, which again maps one lane to one bank with no intra-warp bank conflicts.
+    for (unsigned int bin = warpId; bin < rangeSize; bin += kWarpsPerBlock) {
+        unsigned int sum = s_hist[bin * kHistogramReplicas + lane];
+        sum = warp_reduce_sum(sum);
 
-        if (sum != 0)
-        {
-            // Global histogram is already zeroed by the host; we accumulate with atomicAdd.
+        if (lane == 0u && sum != 0u) {
             atomicAdd(&histogram[bin], sum);
         }
     }
 }
 
+} // namespace
 
-/**
- * Host function to run the histogram kernel.
- *
- * @param input      Device pointer to input chars (allocated via cudaMalloc).
- * @param histogram  Device pointer to output histogram (allocated via cudaMalloc),
- *                   with space for (to - from + 1) unsigned ints.
- * @param inputSize  Number of chars in the input buffer.
- * @param from       Lower bound of character range (inclusive).
- * @param to         Upper bound of character range (inclusive).
- *
- * Notes:
- *  - This function does not perform any host-device synchronization
- *    (cudaDeviceSynchronize/cudaStreamSynchronize). The caller is responsible
- *    for synchronization if needed.
- *  - Uses the default stream (0) for both cudaMemsetAsync and kernel launch.
- */
 void run_histogram(const char *input,
                    unsigned int *histogram,
                    unsigned int inputSize,
                    int from,
-                   int to)
-{
-    // Number of bins in the requested range.
-    const int numBins = to - from + 1;
+                   int to) {
+    // The interface does not accept a stream, so work is enqueued on the default stream.
+    // The caller is responsible for any synchronization/error handling policy.
+    cudaStream_t stream = 0;
 
-    // For safety, handle empty input: just zero the histogram and return.
-    if (inputSize == 0)
-    {
-        cudaMemsetAsync(histogram, 0, static_cast<size_t>(numBins) * sizeof(unsigned int), 0);
+    const unsigned int rangeSize = static_cast<unsigned int>(to - from + 1);
+    const size_t histogramBytes  = static_cast<size_t>(rangeSize) * sizeof(unsigned int);
+
+    // The kernel accumulates block results into the output via global atomics, so the output
+    // histogram must be cleared before launch.
+    cudaMemsetAsync(histogram, 0, histogramBytes, stream);
+
+    if (inputSize == 0u) {
         return;
     }
 
-    // Stride for per-lane histograms in shared memory:
-    //  - At least numBins.
-    //  - Must be odd to ensure gcd(stride, 32) == 1 and thus avoid bank conflicts.
-    int stride = numBins;
-    if ((stride & 1) == 0)  // if even, make it odd
-        ++stride;
+    const size_t sharedBytes =
+        static_cast<size_t>(rangeSize) * static_cast<size_t>(kHistogramReplicas) * sizeof(unsigned int);
 
-    // Kernel configuration.
-    const int blockSize = 256; // Reasonable default for modern GPUs with this shared mem usage.
-    const unsigned int blockChunkSize = blockSize * ITEMS_PER_THREAD;
+    int device = 0;
+    cudaGetDevice(&device);
 
-    // Number of blocks needed to cover all input characters.
-    const unsigned int gridSize =
-        (inputSize + blockChunkSize - 1) / blockChunkSize;
+    int smCount = 0;
+    cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device);
 
-    // Shared memory size: 32 (warp lanes) * stride bins * 4 bytes.
-    const size_t sharedMemSize =
-        static_cast<size_t>(WARP_SIZE) * static_cast<size_t>(stride) * sizeof(unsigned int);
+    int maxActiveBlocksPerSM = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &maxActiveBlocksPerSM,
+        histogram_range_kernel,
+        kBlockSize,
+        sharedBytes);
 
-    // Initialize output histogram to zero on device.
-    cudaMemsetAsync(histogram, 0,
-                    static_cast<size_t>(numBins) * sizeof(unsigned int),
-                    0);
+    if (maxActiveBlocksPerSM < 1) {
+        maxActiveBlocksPerSM = 1;
+    }
 
-    // Launch kernel on default stream.
-    histogram_kernel<ITEMS_PER_THREAD>
-        <<<gridSize, blockSize, sharedMemSize, 0>>>(input,
-                                                    histogram,
-                                                    inputSize,
-                                                    from,
-                                                    numBins,
-                                                    stride);
+    int blocksPerSM = maxActiveBlocksPerSM;
+    if (blocksPerSM > kTargetResidentBlocksPerSM) {
+        blocksPerSM = kTargetResidentBlocksPerSM;
+    }
+
+    const unsigned int requiredBlocks = 1u + (inputSize - 1u) / kBlockWork;
+
+    unsigned int launchBlocks = static_cast<unsigned int>(smCount * blocksPerSM);
+    if (launchBlocks == 0u) {
+        launchBlocks = 1u;
+    }
+    if (launchBlocks > requiredBlocks) {
+        launchBlocks = requiredBlocks;
+    }
+
+    histogram_range_kernel<<<launchBlocks, kBlockSize, sharedBytes, stream>>>(
+        input,
+        histogram,
+        inputSize,
+        static_cast<unsigned int>(from),
+        rangeSize);
 }

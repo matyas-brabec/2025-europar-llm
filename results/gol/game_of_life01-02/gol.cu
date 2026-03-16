@@ -1,160 +1,307 @@
-// Conway's Game of Life - CUDA implementation optimized for modern NVIDIA GPUs (A100/H100)
-//
-// This implementation uses a 2D tiled stencil kernel with shared memory to
-// minimize global memory traffic. Each thread computes one output cell.
-// The input and output grids are in device memory (allocated via cudaMalloc)
-// and are 1-byte per cell (bool). We reinterpret them as uint8_t for more
-// predictable behavior and arithmetic.
-//
-// Key points:
-// - 2D block of threads covers a tile of the grid.
-// - Each block loads a tile of (BLOCK_DIM_Y + 2) x (BLOCK_DIM_X + 2) cells into
-//   shared memory, including a 1-cell halo border on all sides.
-// - Global memory loads for the halo cells handle the boundary condition
-//   ("outside grid is dead") by loading 0 when indices are out of bounds.
-// - Each thread then computes the next state for its corresponding cell using
-//   the 8 neighbors in shared memory.
-// - The rules are implemented in a branchless form for better warp efficiency.
-// - Grid dimensions are assumed to be power-of-two and >= 512, but the kernel
-//   also safely handles arbitrary sizes via boundary checks.
-//
-// The host function `run_game_of_life` launches one kernel step without
-// performing any synchronization; the caller is responsible for synchronization
-// and error checking if desired.
-
 #include <cuda_runtime.h>
-#include <stdint.h>
+#include <cstddef>
 
-// Tuneable block dimensions. 32x32 tends to perform well on modern GPUs for
-// this kind of regular stencil and works nicely with power-of-two grid sizes.
-constexpr int BLOCK_DIM_X = 32;
-constexpr int BLOCK_DIM_Y = 32;
+namespace {
 
-// CUDA kernel for one step of Conway's Game of Life.
-// - input:  pointer to device memory, one byte per cell (0 or 1)
-// - output: pointer to device memory, one byte per cell (0 or 1)
-// - n:      grid dimension (width = height = n)
-template <int BLOCK_X, int BLOCK_Y>
-__global__ void game_of_life_kernel(const uint8_t* __restrict__ input,
-                                    uint8_t* __restrict__ output,
-                                    int n)
-{
-    // Shared memory tile with 1-cell halo on all sides:
-    // tile height = BLOCK_Y + 2, width = BLOCK_X + 2
-    __shared__ uint8_t tile[BLOCK_Y + 2][BLOCK_X + 2];
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-
-    // Global coordinates of the cell this thread is responsible for
-    const int x = blockIdx.x * BLOCK_X + tx;
-    const int y = blockIdx.y * BLOCK_Y + ty;
-
-    // Load the shared memory tile, including halo.
-    //
-    // The tile's coordinate system:
-    //   tile[0 .. BLOCK_Y+1][0 .. BLOCK_X+1]
-    // where:
-    //   - tile[1 .. BLOCK_Y][1 .. BLOCK_X] are the cells owned by this block
-    //   - the halo is at indices 0 and BLOCK_Y+1 in Y, 0 and BLOCK_X+1 in X
-    //
-    // We map each tile coordinate (sx, sy) to global coordinates:
-    //   global_x = blockIdx.x * BLOCK_X + (sx - 1)
-    //   global_y = blockIdx.y * BLOCK_Y + (sy - 1)
-    //
-    // Threads cooperate to load the entire tile using strided loops so that
-    // we can cover the (BLOCK_X+2) x (BLOCK_Y+2) region even when it is larger
-    // than the thread block size.
-    for (int sy = ty; sy < BLOCK_Y + 2; sy += BLOCK_Y) {
-        const int global_y = blockIdx.y * BLOCK_Y + (sy - 1);
-        const bool in_y = (global_y >= 0) && (global_y < n);
-
-        for (int sx = tx; sx < BLOCK_X + 2; sx += BLOCK_X) {
-            const int global_x = blockIdx.x * BLOCK_X + (sx - 1);
-            const bool in_x = (global_x >= 0) && (global_x < n);
-
-            uint8_t val = 0;
-            if (in_x && in_y) {
-                // Row-major indexing: index = y * n + x
-                val = input[global_y * n + global_x];
-            }
-
-            tile[sy][sx] = val;
-        }
-    }
-
-    __syncthreads();
-
-    // Only threads whose global coordinates are within the grid compute/store
-    if (x < n && y < n) {
-        // Local coordinates in the shared memory tile for this thread's cell
-        const int sx = tx + 1;
-        const int sy = ty + 1;
-
-        // Sum of the 8 neighbors around (sy, sx) in the shared memory tile.
-        //
-        // Explicitly enumerated for clarity and to help the compiler unroll.
-        int neighbor_sum = 0;
-        neighbor_sum += tile[sy - 1][sx - 1];
-        neighbor_sum += tile[sy - 1][sx    ];
-        neighbor_sum += tile[sy - 1][sx + 1];
-        neighbor_sum += tile[sy    ][sx - 1];
-        neighbor_sum += tile[sy    ][sx + 1];
-        neighbor_sum += tile[sy + 1][sx - 1];
-        neighbor_sum += tile[sy + 1][sx    ];
-        neighbor_sum += tile[sy + 1][sx + 1];
-
-        const uint8_t center = tile[sy][sx];
-
-        // Branchless implementation of Conway's rules:
-        // - If center == 1 (alive):
-        //     survives if neighbor_sum is 2 or 3
-        // - If center == 0 (dead):
-        //     becomes alive if neighbor_sum is exactly 3
-        //
-        // This can be written as:
-        //   new_state = (neighbor_sum == 3) || (center && neighbor_sum == 2)
-        //
-        // Using bitwise operations (booleans promoted to 0/1):
-        const uint8_t is_3 = (neighbor_sum == 3);
-        const uint8_t is_2 = (neighbor_sum == 2);
-        const uint8_t new_state = static_cast<uint8_t>(is_3 | (center & is_2));
-
-        output[y * n + x] = new_state;
-    }
-}
-
-// Host function to run one step of Conway's Game of Life on the GPU.
+// This implementation intentionally exploits two prompt-specific facts:
 //
-// Parameters:
-// - input:           device pointer to an n x n grid of bools (true/false).
-// - output:          device pointer to an n x n grid of bools to store result.
-// - grid_dimensions: n, the grid size (width = height = n).
+// 1) grid_dimensions is always a power of two and > 512.
+//    That means the grid is exactly divisible by 32, 256, 8, and 4, so all
+//    kernel launch shapes tile the domain perfectly with no per-thread bounds
+//    checks in the hot path.
 //
-// Both input and output must be allocated by cudaMalloc before calling this
-// function. This function does not perform any synchronization or error
-// checking; the caller is responsible for that if desired.
-void run_game_of_life(const bool* input, bool* output, int grid_dimensions)
-{
-    if (grid_dimensions <= 0) {
+// 2) Data transformations inside run_game_of_life are explicitly allowed and
+//    are not measured.
+//    We therefore pack the bool grid into 32-bit words (one bit per cell),
+//    run the actual Game-of-Life step in that packed form, then unpack back to
+//    bool. The packed step updates 32 cells per thread using only bitwise
+//    logic, which is substantially faster than processing one byte per cell.
+//
+// Cells outside the grid are dead; the packed step injects zero-valued halo
+// words/rows at the global boundaries.
+
+using u32 = unsigned int;
+static_assert(sizeof(u32) == 4, "This implementation relies on 32-bit words.");
+
+constexpr u32 kWarpSize = 32u;
+constexpr u32 kWordBits = 32u;
+constexpr u32 kFullMask = 0xFFFFFFFFu;
+constexpr u32 kLastLane = kWarpSize - 1u;
+
+// Pack/unpack:
+// - block = 256 x 4 = 1024 threads
+// - one warp packs/unpacks one 32-cell word
+// - each block covers 8 packed words across x and 4 rows across y
+constexpr u32 kPackBlockX = 256u;
+constexpr u32 kPackBlockY = 4u;
+constexpr u32 kPackWordsPerBlockX = kPackBlockX / kWarpSize;
+
+// Packed Life step:
+// - block = 32 x 8 = 256 threads
+// - one thread updates one packed word = 32 cells
+// - each warp therefore updates one 1024-cell row segment
+// - each block covers 32 packed words across x and 8 rows across y
+constexpr u32 kStepBlockX = 32u;
+constexpr u32 kStepBlockY = 8u;
+constexpr u32 kStepWordsPerBlockX = kStepBlockX;
+
+static_assert(kPackBlockX % kWarpSize == 0u, "Pack/unpack block must contain whole warps.");
+static_assert(kStepBlockX == kWarpSize, "Step kernel assumes blockDim.x == warpSize.");
+static_assert(kWordBits == kWarpSize, "Ballot packing assumes 32-bit words and 32-lane warps.");
+
+struct PackedBufferCache {
+    u32* a = nullptr;
+    u32* b = nullptr;
+    std::size_t capacity_words = 0;
+};
+
+// Per-host-thread cache so steady-state execution avoids cudaMalloc/cudaFree.
+// Plain cudaMalloc/cudaFree are used instead of stream-ordered allocation
+// because run_game_of_life has no stream parameter; this keeps behavior correct
+// under both legacy and per-thread default-stream modes.
+thread_local PackedBufferCache g_cache;
+
+inline void ensure_packed_capacity(const std::size_t required_words) {
+    if (g_cache.capacity_words >= required_words) {
         return;
     }
 
-    // Reinterpret bool* as uint8_t* (bool is 1 byte on CUDA, but using uint8_t
-    // makes arithmetic and shared memory usage more explicit and predictable).
-    const uint8_t* d_input  = reinterpret_cast<const uint8_t*>(input);
-    uint8_t*       d_output = reinterpret_cast<uint8_t*>(output);
+    if (g_cache.a != nullptr) {
+        (void)cudaFree(g_cache.a);
+        g_cache.a = nullptr;
+    }
+    if (g_cache.b != nullptr) {
+        (void)cudaFree(g_cache.b);
+        g_cache.b = nullptr;
+    }
+    g_cache.capacity_words = 0;
 
-    const int n = grid_dimensions;
+    (void)cudaMalloc(reinterpret_cast<void**>(&g_cache.a), required_words * sizeof(u32));
+    (void)cudaMalloc(reinterpret_cast<void**>(&g_cache.b), required_words * sizeof(u32));
+    g_cache.capacity_words = required_words;
+}
 
-    // Configure a 2D grid of 2D blocks.
-    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
-    dim3 grid((n + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
-              (n + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+// Adds one 1-bit neighbor mask into a four-bit per-cell counter represented as
+// parallel bitplanes (ones/twos/fours/eights). Overflow beyond the eights plane
+// is impossible because each Life neighborhood contains exactly eight cells.
+__device__ __forceinline__ void add_mask_to_counter(
+    const u32 v,
+    u32& ones,
+    u32& twos,
+    u32& fours,
+    u32& eights)
+{
+    u32 x = v;
 
-    // Launch one kernel step. No synchronization here; the caller may call
-    // cudaDeviceSynchronize() or use CUDA events as needed.
-    game_of_life_kernel<BLOCK_DIM_X, BLOCK_DIM_Y><<<grid, block>>>(d_input, d_output, n);
+    u32 carry = ones & x;
+    ones ^= x;
+
+    x = carry;
+    carry = twos & x;
+    twos ^= x;
+
+    x = carry;
+    carry = fours & x;
+    fours ^= x;
+
+    eights ^= carry;
+}
+
+// These shift/or forms map to SHF-style funnel shifts on modern NVIDIA GPUs.
+__device__ __forceinline__ u32 shift_west(const u32 word, const u32 left_word) {
+    return (word << 1) | (left_word >> 31);
+}
+
+__device__ __forceinline__ u32 shift_east(const u32 word, const u32 right_word) {
+    return (word >> 1) | (right_word << 31);
+}
+
+__global__ __launch_bounds__(1024)
+void pack_bool_grid_kernel(const unsigned char* __restrict__ input,
+                           u32* __restrict__ packed) {
+    const u32 lane = threadIdx.x & kLastLane;
+    const u32 word_in_block = threadIdx.x / kWarpSize;
+    const u32 word_x = static_cast<u32>(blockIdx.x) * kPackWordsPerBlockX + word_in_block;
+    const u32 y = static_cast<u32>(blockIdx.y) * kPackBlockY + threadIdx.y;
+
+    const u32 words_per_row = static_cast<u32>(gridDim.x) * kPackWordsPerBlockX;
+    const u32 n = words_per_row * kWordBits;
+
+    const std::size_t row_base = static_cast<std::size_t>(y) * static_cast<std::size_t>(n);
+    const std::size_t cell_x =
+        static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(kPackBlockX) +
+        static_cast<std::size_t>(threadIdx.x);
+    const std::size_t cell_index = row_base + cell_x;
+
+    const u32 mask = __ballot_sync(kFullMask, input[cell_index] != 0u);
+
+    if (lane == 0u) {
+        const u32 packed_row_base = y * words_per_row;
+        packed[packed_row_base + word_x] = mask;
+    }
+}
+
+__global__ __launch_bounds__(1024)
+void unpack_bool_grid_kernel(const u32* __restrict__ packed,
+                             unsigned char* __restrict__ output) {
+    const u32 lane = threadIdx.x & kLastLane;
+    const u32 word_in_block = threadIdx.x / kWarpSize;
+    const u32 word_x = static_cast<u32>(blockIdx.x) * kPackWordsPerBlockX + word_in_block;
+    const u32 y = static_cast<u32>(blockIdx.y) * kPackBlockY + threadIdx.y;
+
+    const u32 words_per_row = static_cast<u32>(gridDim.x) * kPackWordsPerBlockX;
+    const u32 n = words_per_row * kWordBits;
+
+    const u32 packed_row_base = y * words_per_row;
+
+    // One packed-word load per warp, then broadcast to all lanes.
+    u32 word = 0u;
+    if (lane == 0u) {
+        word = __ldg(packed + packed_row_base + word_x);
+    }
+    word = __shfl_sync(kFullMask, word, 0);
+
+    const std::size_t row_base = static_cast<std::size_t>(y) * static_cast<std::size_t>(n);
+    const std::size_t cell_x =
+        static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(kPackBlockX) +
+        static_cast<std::size_t>(threadIdx.x);
+    const std::size_t cell_index = row_base + cell_x;
+
+    output[cell_index] = static_cast<unsigned char>((word >> lane) & 1u);
+}
+
+__global__ __launch_bounds__(256)
+void life_step_packed_kernel(const u32* __restrict__ input,
+                             u32* __restrict__ output) {
+    const u32 lane = threadIdx.x;  // blockDim.x is exactly one warp
+    const u32 word_x =
+        static_cast<u32>(blockIdx.x) * kStepWordsPerBlockX + lane;
+    const u32 y =
+        static_cast<u32>(blockIdx.y) * kStepBlockY + threadIdx.y;
+
+    // Packed-row indices fit in 32 bits for the targeted A100/H100 memory
+    // sizes, while the original bool-grid indices may not. The hot packed step
+    // therefore stays on 32-bit addressing.
+    const u32 words_per_row = static_cast<u32>(gridDim.x) * kStepWordsPerBlockX;
+    const u32 row_base = y * words_per_row;
+
+    const bool has_north = (blockIdx.y != 0u) || (threadIdx.y != 0u);
+    const bool has_south = (blockIdx.y + 1u != gridDim.y) || (threadIdx.y + 1u != kStepBlockY);
+    const bool has_left_block = (blockIdx.x != 0u);
+    const bool has_right_block = (blockIdx.x + 1u != gridDim.x);
+
+    const u32* row_c = input + row_base;
+    const u32* row_n = has_north ? (row_c - words_per_row) : nullptr;
+    const u32* row_s = has_south ? (row_c + words_per_row) : nullptr;
+
+    // Three 32-bit loads update 32 cells; adjacent-row reuse is expected to hit
+    // in L1/L2 because neighboring warps process consecutive rows.
+    const u32 north = has_north ? __ldg(row_n + word_x) : 0u;
+    const u32 current = __ldg(row_c + word_x);
+    const u32 south = has_south ? __ldg(row_s + word_x) : 0u;
+
+    // Neighboring packed words inside the warp come from shuffle exchange.
+    // Only the two warp-edge lanes issue extra global loads for the horizontal halo.
+    u32 north_left_word = __shfl_up_sync(kFullMask, north, 1);
+    u32 current_left_word = __shfl_up_sync(kFullMask, current, 1);
+    u32 south_left_word = __shfl_up_sync(kFullMask, south, 1);
+
+    u32 north_right_word = __shfl_down_sync(kFullMask, north, 1);
+    u32 current_right_word = __shfl_down_sync(kFullMask, current, 1);
+    u32 south_right_word = __shfl_down_sync(kFullMask, south, 1);
+
+    if (lane == 0u) {
+        if (has_left_block) {
+            const u32 left_word_x = word_x - 1u;
+            north_left_word = has_north ? __ldg(row_n + left_word_x) : 0u;
+            current_left_word = __ldg(row_c + left_word_x);
+            south_left_word = has_south ? __ldg(row_s + left_word_x) : 0u;
+        } else {
+            north_left_word = 0u;
+            current_left_word = 0u;
+            south_left_word = 0u;
+        }
+    } else if (lane == kLastLane) {
+        if (has_right_block) {
+            const u32 right_word_x = word_x + 1u;
+            north_right_word = has_north ? __ldg(row_n + right_word_x) : 0u;
+            current_right_word = __ldg(row_c + right_word_x);
+            south_right_word = has_south ? __ldg(row_s + right_word_x) : 0u;
+        } else {
+            north_right_word = 0u;
+            current_right_word = 0u;
+            south_right_word = 0u;
+        }
+    }
+
+    // Align the three rows' west/east neighbors onto the current bit positions.
+    const u32 north_west = shift_west(north, north_left_word);
+    const u32 north_east = shift_east(north, north_right_word);
+    const u32 west = shift_west(current, current_left_word);
+    const u32 east = shift_east(current, current_right_word);
+    const u32 south_west = shift_west(south, south_left_word);
+    const u32 south_east = shift_east(south, south_right_word);
+
+    // Sum the eight neighbors as parallel 4-bit counters.
+    u32 ones = 0u;
+    u32 twos = 0u;
+    u32 fours = 0u;
+    u32 eights = 0u;
+
+    add_mask_to_counter(north_west, ones, twos, fours, eights);
+    add_mask_to_counter(north,      ones, twos, fours, eights);
+    add_mask_to_counter(north_east, ones, twos, fours, eights);
+    add_mask_to_counter(west,       ones, twos, fours, eights);
+    add_mask_to_counter(east,       ones, twos, fours, eights);
+    add_mask_to_counter(south_west, ones, twos, fours, eights);
+    add_mask_to_counter(south,      ones, twos, fours, eights);
+    add_mask_to_counter(south_east, ones, twos, fours, eights);
+
+    // Life rule in packed form:
+    // - exactly 3 neighbors -> alive
+    // - exactly 2 neighbors -> keep current state
+    // Counts >= 4 are filtered by ~(fours | eights).
+    const u32 next = (twos & ~(fours | eights)) & (ones | current);
+    output[row_base + word_x] = next;
+}
+
+}  // namespace
+
+/// @FIXED
+/// extern "C" void run_game_of_life(const bool* input, bool* output, int grid_dimensions) {
+void run_game_of_life(const bool* input, bool* output, int grid_dimensions) {
+    // The prompt guarantees:
+    // - square grid
+    // - power-of-two dimensions
+    // - dimensions > 512
+    //
+    // Therefore:
+    // - words_per_row is an integer,
+    // - pack/unpack tiles divide the grid exactly,
+    // - the packed step tile (1024 cells in x, 8 rows in y) also divides exactly.
+
+    const u32 n = static_cast<u32>(grid_dimensions);
+    const u32 words_per_row = n / kWordBits;
+    const std::size_t packed_word_count =
+        static_cast<std::size_t>(n) * static_cast<std::size_t>(words_per_row);
+
+    ensure_packed_capacity(packed_word_count);
+
+    const auto* input_bytes = reinterpret_cast<const unsigned char*>(input);
+    auto* output_bytes = reinterpret_cast<unsigned char*>(output);
+
+    const dim3 pack_block(kPackBlockX, kPackBlockY, 1u);
+    const dim3 pack_grid(words_per_row / kPackWordsPerBlockX, n / kPackBlockY, 1u);
+
+    const dim3 step_block(kStepBlockX, kStepBlockY, 1u);
+    const dim3 step_grid(words_per_row / kStepWordsPerBlockX, n / kStepBlockY, 1u);
+
+    // In steady state this function is just three launches:
+    // pack -> packed Life step -> unpack.
+    // No synchronization is performed here; the caller owns synchronization.
+    pack_bool_grid_kernel<<<pack_grid, pack_block>>>(input_bytes, g_cache.a);
+    life_step_packed_kernel<<<step_grid, step_block>>>(g_cache.a, g_cache.b);
+    unpack_bool_grid_kernel<<<pack_grid, pack_block>>>(g_cache.b, output_bytes);
 }
 
 // The content below was not generated by GPT; it was added to ensure the framework can compile the code.

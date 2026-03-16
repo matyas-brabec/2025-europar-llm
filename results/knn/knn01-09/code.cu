@@ -1,270 +1,328 @@
 #include <cuda_runtime.h>
 #include <utility>
-#include <cfloat>
+#include <cstddef>
 
-/*
- * Optimized k-NN (k-nearest neighbors) for 2D points on modern NVIDIA GPUs.
- *
- * Design overview:
- * ----------------
- * - Each CUDA block processes exactly one query point.
- * - Threads in the block cooperatively compute squared Euclidean distances from
- *   that query to all data points.
- * - Distances are processed in tiles and stored in shared memory.
- * - A single thread (thread 0) in each block maintains a max-heap of size k
- *   (stored in shared memory) containing the current k nearest neighbors.
- *   This guarantees O(N log k) work per query, where N = data_count.
- * - After all data points are processed, the heap is converted into a sorted
- *   list (ascending by distance) and written to the result array.
- *
- * Parallelism:
- * ------------
- * - Distance computation is fully parallel within each tile: all threads in the
- *   block compute distances for different data points.
- * - Heap maintenance is done by a single thread per query (thread 0), but since
- *   there are many queries (thousands) and each query is assigned to a
- *   different block, the GPU executes many such heaps in parallel.
- *
- * Memory usage:
- * -------------
- * Shared memory per block:
- *   - TILE_SIZE distances (float) + indices (int)
- *   - K_MAX best distances (float) + indices (int)
- *   Total = TILE_SIZE * 8 bytes + K_MAX * 8 bytes
- *         = 4096 * 8 + 1024 * 8 = 40,960 bytes (< 48 KB default per-block limit)
- *
- * Constraints:
- * ------------
- * - k is a power of two in [32, 1024].
- * - data_count >= k.
- * - No additional device memory allocations (cudaMalloc) are performed.
- */
+namespace {
 
-#ifndef KNN_K_MAX
-#define KNN_K_MAX 1024
-#endif
+// Exact brute-force k-NN for 2D points.
+//
+// Main design choices:
+//
+// 1) One warp owns one query.
+//    - 256 threads / CTA => 8 warps / CTA => 8 queries processed together.
+//
+// 2) The CTA streams the data set through shared memory.
+//    - Each loaded data tile is reused by all 8 queries in the CTA.
+//    - This is the dominant optimization because the kernel is bandwidth-bound.
+//
+// 3) Each query keeps an exact top-k as a max-heap in shared memory.
+//    - Only lane 0 mutates the heap.
+//    - All 32 lanes compute distances and forward only promising candidates
+//      to lane 0 via ballot+shuffle.
+//
+// 4) Heap entries are stored as a single 64-bit key:
+//        high 32 bits = float distance bit pattern
+//        low  32 bits = integer data index
+//    For non-negative floats, unsigned ordering of the high 32 bits matches
+//    numeric ordering of the distance, so unsigned 64-bit ordering matches
+//    lexicographic ordering by (distance, index).
+//    This makes heap comparisons cheap and also lets the final write be a
+//    single 64-bit store directly into the pair<int,float> output buffer on
+//    the standard little-endian CUDA ABI.
+//
+// 5) Shared memory budget is fixed at 80 KiB / CTA.
+//    - On A100, 2 CTAs/SM fit exactly (163,840 B / SM).
+//    - H100 also handles this comfortably.
+//    - Tile size is specialized by K so that heap bytes + tile bytes = 80 KiB.
 
-#ifndef KNN_TILE_SIZE
-#define KNN_TILE_SIZE 4096
-#endif
+using PackedKnnWord = unsigned long long;
 
-#ifndef KNN_THREADS_PER_BLOCK
-#define KNN_THREADS_PER_BLOCK 256
-#endif
+constexpr int KNN_THREADS          = 256;
+constexpr int KNN_WARPS_PER_BLOCK  = KNN_THREADS / 32;
+constexpr int KNN_SHARED_BYTES     = 80 * 1024;
+constexpr int KNN_BATCH_GROUPS     = 4;   // refresh cutoff every 128 points / warp
 
-// Device function to insert a candidate into a max-heap of size up to k.
-// The heap is stored in two parallel arrays: best_dist and best_idx.
-// Heap invariant: best_dist[0] is the largest distance in the heap.
-// Only thread 0 of each block calls this function, so no synchronization is needed here.
-__device__ __forceinline__
-void heap_insert_max(float *best_dist, int *best_idx,
-                     int &heap_size, const int k,
-                     float dist, int idx)
-{
-    // If heap is not full yet, insert new element and heapify up.
-    if (heap_size < k)
-    {
-        int i = heap_size;
-        heap_size++;
+static_assert(sizeof(int) == 4, "This implementation assumes 32-bit int.");
+static_assert(sizeof(float) == 4, "This implementation assumes IEEE-754 float.");
+static_assert(sizeof(PackedKnnWord) == 8, "PackedKnnWord must be 64-bit.");
+static_assert(sizeof(std::pair<int, float>) == sizeof(PackedKnnWord),
+              "This implementation assumes std::pair<int,float> occupies 8 bytes.");
 
-        // Heapify up to maintain max-heap property.
-        while (i > 0)
-        {
-            int parent = (i - 1) >> 1;
-            if (best_dist[parent] >= dist)
-                break;
+template <int K>
+struct KnnConfig {
+    static constexpr int HEAP_BYTES  = KNN_WARPS_PER_BLOCK * K * sizeof(PackedKnnWord);
+    static constexpr int TILE_POINTS = (KNN_SHARED_BYTES - HEAP_BYTES) / (2 * sizeof(float));
 
-            best_dist[i] = best_dist[parent];
-            best_idx[i] = best_idx[parent];
-            i = parent;
+    static_assert(K >= 32 && K <= 1024 && ((K & (K - 1)) == 0),
+                  "k must be a power of two in [32, 1024].");
+    static_assert(TILE_POINTS >= K, "The first tile must be large enough to seed the heap.");
+    static_assert((TILE_POINTS % 32) == 0, "Tile size must be warp-aligned.");
+    static_assert(2 * TILE_POINTS * static_cast<int>(sizeof(float)) + HEAP_BYTES == KNN_SHARED_BYTES,
+                  "Shared-memory layout must exactly match the 80 KiB budget.");
+};
+
+__device__ __forceinline__ float sq_l2(const float qx, const float qy,
+                                       const float px, const float py) {
+    const float dx = qx - px;
+    const float dy = qy - py;
+    return fmaf(dx, dx, dy * dy);
+}
+
+__device__ __forceinline__ PackedKnnWord pack_key(const float dist, const int idx) {
+    return (static_cast<PackedKnnWord>(__float_as_uint(dist)) << 32) |
+           static_cast<unsigned int>(idx);
+}
+
+__device__ __forceinline__ void sift_down_max(PackedKnnWord* heap, int root, const int count) {
+    PackedKnnWord value = heap[root];
+
+    for (int child = (root << 1) + 1; child < count; child = (root << 1) + 1) {
+        int worst_child = child;
+        const int right = child + 1;
+        if (right < count && heap[right] > heap[child]) {
+            worst_child = right;
         }
-        best_dist[i] = dist;
-        best_idx[i] = idx;
+        if (heap[worst_child] <= value) {
+            break;
+        }
+        heap[root] = heap[worst_child];
+        root = worst_child;
     }
-    // If heap is full and this candidate is better than the current worst,
-    // replace the root and heapify down.
-    else if (dist < best_dist[0])
-    {
-        int i = 0;
 
-        // We use "dist" and "idx" as the new value to sink down the heap.
-        while (true)
-        {
-            int left  = (i << 1) + 1;
-            if (left >= heap_size)
-                break;
+    heap[root] = value;
+}
 
-            int right = left + 1;
-            int largest = left;
-
-            if (right < heap_size && best_dist[right] > best_dist[left])
-                largest = right;
-
-            if (best_dist[largest] <= dist)
-                break;
-
-            best_dist[i] = best_dist[largest];
-            best_idx[i] = best_idx[largest];
-            i = largest;
-        }
-
-        best_dist[i] = dist;
-        best_idx[i] = idx;
+__device__ __forceinline__ void heapify_max(PackedKnnWord* heap, const int count) {
+    for (int root = (count >> 1) - 1; root >= 0; --root) {
+        sift_down_max(heap, root, count);
     }
 }
 
-// Kernel implementing k-NN for 2D points using squared Euclidean distance.
-__global__
-void knn2d_kernel(const float2 * __restrict__ query,
-                  int query_count,
-                  const float2 * __restrict__ data,
-                  int data_count,
-                  std::pair<int, float> * __restrict__ result,
-                  int k)
-{
-    // Shared memory buffers:
-    // - s_tile_dist / s_tile_idx store a tile of distances and corresponding indices.
-    // - s_best_dist / s_best_idx store the current max-heap of k best neighbors.
-    __shared__ float s_tile_dist[KNN_TILE_SIZE];
-    __shared__ int   s_tile_idx[KNN_TILE_SIZE];
-    __shared__ float s_best_dist[KNN_K_MAX];
-    __shared__ int   s_best_idx[KNN_K_MAX];
-
-    const int qid = blockIdx.x;
-    if (qid >= query_count)
-        return;
-
-    // Load the query point for this block.
-    const float2 q = query[qid];
-
-    // Local heap size for this block's query.
-    // Only thread 0 uses and updates this variable.
-    int heap_size = 0;
-
-    // Process the data in tiles.
-    for (int tile_start = 0; tile_start < data_count; tile_start += KNN_TILE_SIZE)
-    {
-        int remaining = data_count - tile_start;
-        int tile_elems = (remaining > KNN_TILE_SIZE) ? KNN_TILE_SIZE : remaining;
-
-        // Each thread computes distances for a subset of points in this tile.
-        for (int i = threadIdx.x; i < tile_elems; i += blockDim.x)
-        {
-            int idx = tile_start + i;
-            float2 p = data[idx];
-
-            float dx = p.x - q.x;
-            float dy = p.y - q.y;
-            float dist = dx * dx + dy * dy;  // squared Euclidean distance
-
-            s_tile_dist[i] = dist;
-            s_tile_idx[i] = idx;
-        }
-
-        // Ensure all distances for this tile are computed before using them.
-        __syncthreads();
-
-        // Thread 0 updates the heap with all candidates from this tile.
-        if (threadIdx.x == 0)
-        {
-            for (int i = 0; i < tile_elems; ++i)
-            {
-                float dist = s_tile_dist[i];
-                int idx = s_tile_idx[i];
-                heap_insert_max(s_best_dist, s_best_idx, heap_size, k, dist, idx);
-            }
-        }
-
-        // Ensure thread 0 is done with this tile before reusing shared memory.
-        __syncthreads();
+__device__ __forceinline__ void replace_root_if_better(PackedKnnWord* heap,
+                                                       const PackedKnnWord cand,
+                                                       const int count) {
+    if (cand < heap[0]) {
+        heap[0] = cand;
+        sift_down_max(heap, 0, count);
     }
+}
 
-    // After processing all data points, the heap in s_best_* contains the k nearest
-    // neighbors for this query, but arranged as a max-heap (largest distance at root).
-    // We now extract them into the result array in ascending order of distance.
-    if (threadIdx.x == 0)
-    {
-        // heap_size should be exactly k since data_count >= k.
-        int hsize = heap_size;
-        std::pair<int, float> *row = result + qid * k;
+__device__ __forceinline__ void heapsort_ascending(PackedKnnWord* heap, const int count) {
+    for (int end = count - 1; end > 0; --end) {
+        const PackedKnnWord tmp = heap[0];
+        heap[0] = heap[end];
+        heap[end] = tmp;
+        sift_down_max(heap, 0, end);
+    }
+}
 
-        // Perform an in-place heap sort on the heap arrays, writing into 'row'.
-        // We repeatedly remove the maximum (root) and place it at position i;
-        // by filling from the end to the beginning, we obtain ascending order.
-        for (int i = hsize - 1; i >= 0; --i)
-        {
-            // Extract root (current maximum distance).
-            int   best_index = s_best_idx[0];
-            float best_dist  = s_best_dist[0];
+__device__ __forceinline__ void load_tile_soa(const float2* __restrict__ data,
+                                              const int base,
+                                              const int count,
+                                              float* __restrict__ tile_x,
+                                              float* __restrict__ tile_y) {
+    // Shared-memory tile is stored as SoA instead of AoS to avoid 64-bit shared
+    // memory bank conflicts when a warp reads consecutive points.
+    for (int t = threadIdx.x; t < count; t += KNN_THREADS) {
+        const float2 p = data[base + t];
+        tile_x[t] = p.x;
+        tile_y[t] = p.y;
+    }
+}
 
-            row[i].first  = best_index;
-            row[i].second = best_dist;
+template <int K>
+__device__ __forceinline__ void process_tile_for_query(
+    const float qx, const float qy,
+    const float* __restrict__ tile_x,
+    const float* __restrict__ tile_y,
+    const int tile_base,
+    const int tile_count,
+    const int local_start,
+    PackedKnnWord* __restrict__ heap) {
 
-            // Move the last element to the root and reduce heap size.
-            float last_dist = s_best_dist[hsize - 1];
-            int   last_idx  = s_best_idx[hsize - 1];
-            hsize--;
+    constexpr unsigned FULL_MASK = 0xffffffffu;
+    constexpr int GROUP_POINTS = 32 * KNN_BATCH_GROUPS;
 
-            int current = 0;
+    const int lane = threadIdx.x & 31;
+    const PackedKnnWord invalid_key = ~PackedKnnWord(0);
 
-            // Heapify down.
-            while (true)
-            {
-                int left  = (current << 1) + 1;
-                if (left >= hsize)
-                    break;
+    PackedKnnWord cutoff_key =
+        __shfl_sync(FULL_MASK, (lane == 0 ? heap[0] : PackedKnnWord(0)), 0);
 
-                int right = left + 1;
-                int largest = left;
+    for (int group_base = local_start; group_base < tile_count; group_base += GROUP_POINTS) {
+        bool heap_changed = false;
 
-                if (right < hsize && s_best_dist[right] > s_best_dist[left])
-                    largest = right;
+        #pragma unroll
+        for (int sub = 0; sub < KNN_BATCH_GROUPS; ++sub) {
+            const int loc = group_base + (sub << 5) + lane;
 
-                if (s_best_dist[largest] <= last_dist)
-                    break;
-
-                s_best_dist[current] = s_best_dist[largest];
-                s_best_idx[current]  = s_best_idx[largest];
-                current = largest;
+            PackedKnnWord cand = invalid_key;
+            if (loc < tile_count) {
+                const float d = sq_l2(qx, qy, tile_x[loc], tile_y[loc]);
+                cand = pack_key(d, tile_base + loc);
             }
 
-            if (hsize > 0)
-            {
-                s_best_dist[current] = last_dist;
-                s_best_idx[current]  = last_idx;
+            // Using a slightly stale cutoff inside this short group is safe:
+            // the heap root only ever decreases, so this can create extra
+            // candidate traffic but cannot miss a true top-k element. Lane 0
+            // always rechecks against the current heap root before insertion.
+            unsigned mask = __ballot_sync(FULL_MASK, loc < tile_count && cand < cutoff_key);
+
+            if (mask) {
+                heap_changed = true;
+                while (mask) {
+                    const int src = __ffs(mask) - 1;
+                    const PackedKnnWord candidate = __shfl_sync(FULL_MASK, cand, src);
+                    if (lane == 0) {
+                        replace_root_if_better(heap, candidate, K);
+                    }
+                    mask &= mask - 1;
+                }
             }
+        }
+
+        if (heap_changed) {
+            __syncwarp();
+            cutoff_key = __shfl_sync(FULL_MASK,
+                                     (lane == 0 ? heap[0] : PackedKnnWord(0)),
+                                     0);
         }
     }
 }
 
-// Host function interface as requested.
-void run_knn(const float2 *query,
+template <int K>
+__global__ __launch_bounds__(256, 2)
+void knn_kernel(const float2* __restrict__ query,
+                const int query_count,
+                const float2* __restrict__ data,
+                const int data_count,
+                PackedKnnWord* __restrict__ result_words) {
+    using C = KnnConfig<K>;
+    constexpr unsigned FULL_MASK = 0xffffffffu;
+
+    extern __shared__ __align__(8) unsigned char smem[];
+
+    float* const tile_x = reinterpret_cast<float*>(smem);
+    float* const tile_y = tile_x + C::TILE_POINTS;
+    PackedKnnWord* const heaps = reinterpret_cast<PackedKnnWord*>(tile_y + C::TILE_POINTS);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int query_id = static_cast<int>(blockIdx.x) * KNN_WARPS_PER_BLOCK + warp;
+    const bool active = query_id < query_count;
+
+    PackedKnnWord* const my_heap = heaps + warp * K;
+
+    float qx_local = 0.0f;
+    float qy_local = 0.0f;
+    if (lane == 0 && active) {
+        const float2 q = query[query_id];
+        qx_local = q.x;
+        qy_local = q.y;
+    }
+
+    const float qx = __shfl_sync(FULL_MASK, qx_local, 0);
+    const float qy = __shfl_sync(FULL_MASK, qy_local, 0);
+
+    // First tile: also seeds the heap. By construction TILE_POINTS >= K.
+    int tile_count = (data_count < C::TILE_POINTS) ? data_count : C::TILE_POINTS;
+    load_tile_soa(data, 0, tile_count, tile_x, tile_y);
+    __syncthreads();
+
+    if (active && lane == 0) {
+        for (int i = 0; i < K; ++i) {
+            my_heap[i] = pack_key(sq_l2(qx, qy, tile_x[i], tile_y[i]), i);
+        }
+        heapify_max(my_heap, K);
+    }
+    __syncwarp();
+
+    if (active && tile_count > K) {
+        process_tile_for_query<K>(qx, qy, tile_x, tile_y, 0, tile_count, K, my_heap);
+    }
+    __syncthreads();
+
+    // Remaining tiles.
+    for (int tile_base = C::TILE_POINTS; tile_base < data_count; tile_base += C::TILE_POINTS) {
+        tile_count = data_count - tile_base;
+        if (tile_count > C::TILE_POINTS) {
+            tile_count = C::TILE_POINTS;
+        }
+
+        load_tile_soa(data, tile_base, tile_count, tile_x, tile_y);
+        __syncthreads();
+
+        if (active) {
+            process_tile_for_query<K>(qx, qy, tile_x, tile_y, tile_base, tile_count, 0, my_heap);
+        }
+
+        __syncthreads();
+    }
+
+    // Convert the max-heap into ascending nearest-neighbor order.
+    if (active && lane == 0) {
+        heapsort_ascending(my_heap, K);
+    }
+    __syncwarp();
+
+    if (active) {
+        const std::size_t out_base = static_cast<std::size_t>(query_id) * K;
+        for (int j = lane; j < K; j += 32) {
+            // The packed key stores:
+            //   low  32 bits = index
+            //   high 32 bits = float distance bits
+            // This matches the in-memory layout of pair<int,float> on the
+            // little-endian CUDA ABI, so a single 64-bit store writes the
+            // required {index, distance} pair.
+            result_words[out_base + j] = my_heap[j];
+        }
+    }
+}
+
+template <int K>
+inline void launch_knn_impl(const float2* query,
+                            const int query_count,
+                            const float2* data,
+                            const int data_count,
+                            PackedKnnWord* result_words) {
+    using C = KnnConfig<K>;
+
+    (void)cudaFuncSetAttribute(knn_kernel<K>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               KNN_SHARED_BYTES);
+    (void)cudaFuncSetAttribute(knn_kernel<K>,
+                               cudaFuncAttributePreferredSharedMemoryCarveout,
+                               100);
+
+    const dim3 block(KNN_THREADS);
+    const dim3 grid((query_count + KNN_WARPS_PER_BLOCK - 1) / KNN_WARPS_PER_BLOCK);
+
+    knn_kernel<K><<<grid, block, KNN_SHARED_BYTES>>>(
+        query, query_count, data, data_count, result_words);
+}
+
+} // anonymous namespace
+
+void run_knn(const float2* query,
              int query_count,
-             const float2 *data,
+             const float2* data,
              int data_count,
-             std::pair<int, float> *result,
-             int k)
-{
-    // Assumptions from the problem statement:
-    // - query, data, and result are already allocated on the device using cudaMalloc.
-    // - data_count >= k.
-    // - k is a power of two between 32 and 1024 inclusive.
-
-    // Guard against k exceeding compile-time maximum.
-    if (k > KNN_K_MAX || k <= 0 || query_count <= 0 || data_count <= 0)
+             std::pair<int, float>* result,
+             int k) {
+    if (query_count <= 0) {
         return;
+    }
 
-    dim3 block_dim(KNN_THREADS_PER_BLOCK);
-    dim3 grid_dim(query_count);
+    PackedKnnWord* const result_words = reinterpret_cast<PackedKnnWord*>(result);
 
-    knn2d_kernel<<<grid_dim, block_dim>>>(query,
-                                          query_count,
-                                          data,
-                                          data_count,
-                                          result,
-                                          k);
-
-    // No explicit cudaDeviceSynchronize() here to allow asynchronous execution.
-    // The caller can synchronize or perform a blocking cudaMemcpy from 'result'
-    // to the host to ensure completion.
+    switch (k) {
+        case 32:   launch_knn_impl<32>(query, query_count, data, data_count, result_words); break;
+        case 64:   launch_knn_impl<64>(query, query_count, data, data_count, result_words); break;
+        case 128:  launch_knn_impl<128>(query, query_count, data, data_count, result_words); break;
+        case 256:  launch_knn_impl<256>(query, query_count, data, data_count, result_words); break;
+        case 512:  launch_knn_impl<512>(query, query_count, data, data_count, result_words); break;
+        case 1024: launch_knn_impl<1024>(query, query_count, data, data_count, result_words); break;
+        default:   break; // k is guaranteed valid by the caller contract.
+    }
 }

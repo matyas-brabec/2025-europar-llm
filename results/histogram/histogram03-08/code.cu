@@ -1,145 +1,218 @@
 #include <cuda_runtime.h>
+#include <cstddef>
+#include <cstdint>
 
-/*
- * CUDA kernel to compute a histogram over a restricted character range [from, to].
- *
- * Optimization strategy:
- *  - Use shared memory for histogram privatization to drastically reduce the number
- *    of atomic operations on global memory.
- *  - Each warp in a block gets its own private histogram in shared memory.
- *    Threads in the same warp atomically update that warp-private histogram.
- *  - After processing, per-warp histograms are reduced within the block and the
- *    block-level results are added to the global histogram using a small number
- *    of global atomic operations (one per bin per block).
- *
- * Parameters:
- *  input         - device pointer to input text buffer (chars)
- *  histogram     - device pointer to output histogram (size = to - from + 1)
- *  numElements   - number of characters in input
- *  from, to      - inclusive range of character codes to track (0 <= from < to <= 255)
- */
-__global__ void histogram_kernel(const char* __restrict__ input,
-                                 unsigned int* __restrict__ histogram,
-                                 unsigned int numElements,
-                                 int from,
-                                 int to)
+constexpr int kWarpSize = 32;
+constexpr int kBlockThreads = 256;
+constexpr int kWarpsPerBlock = kBlockThreads / kWarpSize;
+static_assert((kBlockThreads % kWarpSize) == 0, "kBlockThreads must be a multiple of 32.");
+
+constexpr unsigned int kMaxBins = 256u;
+
+// One extra slot is reserved per warp-private histogram.
+// - It acts as padding, so neighboring warp histograms are not separated by an exact
+//   multiple of 32 banks.
+// - It is also used as the out-of-range sentinel key for warp matching.
+constexpr unsigned int kInvalidBin = kMaxBins;         // index 256
+constexpr unsigned int kWarpHistStride = kMaxBins + 1u; // 257
+
+constexpr std::size_t kVectorBytes = sizeof(uint4);
+constexpr std::size_t kVectorAlignMask = kVectorBytes - 1u;
+
+// Launch heuristic: bias slightly toward more CTAs on mid-size inputs.
+// The per-block global merge cost is only one atomic add per output bin, so a
+// moderately larger grid is usually worth it to keep the GPU busy.
+constexpr unsigned int kLaunchBytesPerThread = 8u;
+constexpr unsigned int kTargetBytesPerBlock =
+    static_cast<unsigned int>(kBlockThreads) * kLaunchBytesPerThread;
+
+// Collapse equal-bin lanes inside a warp before touching shared memory.
+// Because each warp owns a private histogram segment, one elected leader lane can
+// update shared memory with a plain increment instead of a shared-memory atomic.
+//
+// The explicit __syncwarp(activeMask) is required for correctness on Volta+
+// independent thread scheduling: all participating lanes must reconverge before the
+// next warp-wide primitive that uses the same active mask.
+__device__ __forceinline__
+void warp_aggregated_private_add(const unsigned int bin,
+                                 const unsigned int numBins,
+                                 const unsigned int activeMask,
+                                 const unsigned int laneBit,
+                                 unsigned int* const warpHist)
 {
-    extern __shared__ unsigned int s_hist[]; // shared memory: per-warp histograms
+    const unsigned int key = (bin < numBins) ? bin : kInvalidBin;
+    const unsigned int peers = __match_any_sync(activeMask, key);
 
-    const int tid            = threadIdx.x;
-    const int blockThreads   = blockDim.x;
-    const int globalThreadId = blockIdx.x * blockThreads + tid;
-    const int gridStride     = blockThreads * gridDim.x;
-    const int rangeLen       = to - from + 1;
+    if (key < numBins && (peers & (laneBit - 1u)) == 0u) {
+        warpHist[key] += __popc(peers);
+    }
 
-    const int warp_id        = tid / warpSize;
-    const int warpsPerBlock  = (blockThreads + warpSize - 1) / warpSize;
+    __syncwarp(activeMask);
+}
 
-    // Pointer to this warp's private histogram segment in shared memory
-    unsigned int* warp_hist = s_hist + warp_id * rangeLen;
+__device__ __forceinline__
+void accumulate_packed_u32(const unsigned int word,
+                           const unsigned int from,
+                           const unsigned int numBins,
+                           const unsigned int activeMask,
+                           const unsigned int laneBit,
+                           unsigned int* const warpHist)
+{
+    warp_aggregated_private_add(((word >>  0) & 0xFFu) - from, numBins, activeMask, laneBit, warpHist);
+    warp_aggregated_private_add(((word >>  8) & 0xFFu) - from, numBins, activeMask, laneBit, warpHist);
+    warp_aggregated_private_add(((word >> 16) & 0xFFu) - from, numBins, activeMask, laneBit, warpHist);
+    warp_aggregated_private_add(((word >> 24) & 0xFFu) - from, numBins, activeMask, laneBit, warpHist);
+}
 
-    // Initialize the entire shared-memory histogram (all warps) to zero.
-    // All threads in the block cooperate to clear warpsPerBlock * rangeLen bins.
-    for (int i = tid; i < warpsPerBlock * rangeLen; i += blockThreads) {
-        s_hist[i] = 0;
+// Per-block algorithm:
+// 1) Zero warp-private histograms in shared memory.
+// 2) Process the input with grid-stride loops. A short scalar prefix is peeled so
+//    the main path can use aligned uint4 loads.
+// 3) Reduce the warp-private histograms and merge one partial histogram per block
+//    into the global output.
+__global__ __launch_bounds__(kBlockThreads)
+void histogram_range_kernel(const char* __restrict__ input,
+                            unsigned int* __restrict__ histogram,
+                            const unsigned int inputSize,
+                            const unsigned int from,
+                            const unsigned int numBins)
+{
+    __shared__ unsigned int sharedHist[kWarpsPerBlock * kWarpHistStride];
+
+    #pragma unroll
+    for (unsigned int i = threadIdx.x; i < kWarpsPerBlock * kWarpHistStride; i += kBlockThreads) {
+        sharedHist[i] = 0u;
+    }
+    __syncthreads();
+
+    const unsigned int lane = threadIdx.x & (kWarpSize - 1u);
+    const unsigned int laneBit = 1u << lane;
+    const unsigned int warp = threadIdx.x / kWarpSize;
+    unsigned int* const warpHist = sharedHist + warp * kWarpHistStride;
+
+    const std::size_t globalThread = static_cast<std::size_t>(blockIdx.x) * kBlockThreads + threadIdx.x;
+    const std::size_t totalThreads = static_cast<std::size_t>(gridDim.x) * kBlockThreads;
+
+    const unsigned char* const inputBytes =
+        reinterpret_cast<const unsigned char*>(input);
+    const std::size_t totalBytes = static_cast<std::size_t>(inputSize);
+
+    // Peel up to 15 bytes so the main uint4 path is always 16-byte aligned even if
+    // the incoming char* is not.
+    const std::size_t misalignment =
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(inputBytes)) & kVectorAlignMask;
+    const std::size_t rawHeadBytes = (kVectorBytes - misalignment) & kVectorAlignMask;
+    const std::size_t headBytes = (rawHeadBytes < totalBytes) ? rawHeadBytes : totalBytes;
+
+    // Scalar prefix.
+    for (std::size_t i = globalThread; i < headBytes; i += totalThreads) {
+        const unsigned int activeMask = __activemask();
+        const unsigned int bin = static_cast<unsigned int>(inputBytes[i]) - from;
+        warp_aggregated_private_add(bin, numBins, activeMask, laneBit, warpHist);
+    }
+
+    // Main aligned vectorized body.
+    const std::size_t remainingBytes = totalBytes - headBytes;
+    const std::size_t vecCount = remainingBytes / kVectorBytes;
+    const uint4* const input4 =
+        reinterpret_cast<const uint4*>(inputBytes + headBytes);
+
+    for (std::size_t vec = globalThread; vec < vecCount; vec += totalThreads) {
+        const unsigned int activeMask = __activemask();
+        const uint4 packed = input4[vec];
+
+        accumulate_packed_u32(packed.x, from, numBins, activeMask, laneBit, warpHist);
+        accumulate_packed_u32(packed.y, from, numBins, activeMask, laneBit, warpHist);
+        accumulate_packed_u32(packed.z, from, numBins, activeMask, laneBit, warpHist);
+        accumulate_packed_u32(packed.w, from, numBins, activeMask, laneBit, warpHist);
+    }
+
+    // Scalar tail.
+    const std::size_t tailStart = headBytes + vecCount * kVectorBytes;
+    for (std::size_t i = tailStart + globalThread; i < totalBytes; i += totalThreads) {
+        const unsigned int activeMask = __activemask();
+        const unsigned int bin = static_cast<unsigned int>(inputBytes[i]) - from;
+        warp_aggregated_private_add(bin, numBins, activeMask, laneBit, warpHist);
     }
 
     __syncthreads();
 
-    // Grid-stride loop over input data for good load balancing and coalesced loads.
-    for (unsigned int idx = globalThreadId; idx < numElements; idx += gridStride) {
-        unsigned char c = static_cast<unsigned char>(input[idx]);
+    // Merge the per-warp private histograms.
+    // With a multi-block launch we need global atomics, but only one per block/bin.
+    const bool singleBlock = (gridDim.x == 1u);
 
-        // Compute bin index relative to 'from'.
-        // Using unsigned comparison to compact range check:
-        //   if 0 <= (c - from) < rangeLen => c in [from, to]
-        int bin = static_cast<int>(c) - from;
-        unsigned int uBin = static_cast<unsigned int>(bin);
-        if (uBin < static_cast<unsigned int>(rangeLen)) {
-            // Atomic update in shared memory (fast compared to global atomics).
-            atomicAdd(&warp_hist[uBin], 1);
-        }
-    }
+    for (unsigned int bin = threadIdx.x; bin < numBins; bin += kBlockThreads) {
+        unsigned int sum = 0u;
 
-    __syncthreads();
-
-    // Reduce per-warp histograms into global histogram.
-    // Each thread accumulates several bins if rangeLen > blockDim.x.
-    for (int bin = tid; bin < rangeLen; bin += blockThreads) {
-        unsigned int sum = 0;
-
-        // Sum contributions from all warps in this block for this bin.
-        for (int w = 0; w < warpsPerBlock; ++w) {
-            sum += s_hist[w * rangeLen + bin];
+        #pragma unroll
+        for (int w = 0; w < kWarpsPerBlock; ++w) {
+            sum += sharedHist[w * kWarpHistStride + bin];
         }
 
-        // Only perform global atomicAdd if there is a contribution.
-        if (sum != 0) {
-            atomicAdd(&histogram[bin], sum);
+        if (sum != 0u) {
+            if (singleBlock) {
+                histogram[bin] = sum;
+            } else {
+                atomicAdd(histogram + bin, sum);
+            }
         }
     }
 }
 
-/*
- * Host function to launch the CUDA histogram kernel.
- *
- * Assumptions:
- *  - 'input' points to device memory containing 'inputSize' chars.
- *  - 'histogram' points to device memory large enough to hold (to - from + 1)
- *    unsigned int counters.
- *  - All required host-device synchronization (e.g., cudaDeviceSynchronize)
- *    will be performed by the caller; this function only launches the kernel.
- *
- * Steps:
- *  1. Zero the histogram output buffer on the device.
- *  2. Configure a grid/block layout suitable for modern data-center GPUs.
- *  3. Compute required shared memory size for per-warp histograms.
- *  4. Launch the histogram kernel.
- */
+static inline unsigned int ceil_div_u32(const unsigned int x, const unsigned int y)
+{
+    return (x + y - 1u) / y;
+}
+
 void run_histogram(const char *input,
                    unsigned int *histogram,
                    unsigned int inputSize,
                    int from,
                    int to)
 {
-    // Trivial cases: nothing to process.
-    if (inputSize == 0 || from > to) {
+    const unsigned int numBins = static_cast<unsigned int>(to - from + 1);
+
+    // The kernel merges block-private results with global atomic adds, so the
+    // requested output range must be cleared first. This is intentionally async;
+    // the caller owns host-device synchronization.
+    (void)cudaMemsetAsync(histogram, 0, static_cast<std::size_t>(numBins) * sizeof(unsigned int));
+
+    if (inputSize == 0u) {
         return;
     }
 
-    const int rangeLen = to - from + 1;
-
-    // Initialize the device histogram to zero.
-    cudaMemset(histogram, 0, rangeLen * sizeof(unsigned int));
-
-    // Use a reasonable number of threads per block for histogram-like workloads.
-    const int THREADS_PER_BLOCK = 256;
-
+    // The API does not expose a stream parameter, so all work is enqueued on the
+    // default stream. Occupancy is queried at runtime so the launch adapts to the
+    // actual target GPU and compiler register allocation.
     int device = 0;
-    cudaGetDevice(&device);
+    int smCount = 1;
+    int activeBlocksPerSM = 1;
 
-    cudaDeviceProp props;
-    cudaGetDeviceProperties(&props, device);
+    (void)cudaGetDevice(&device);
+    (void)cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device);
+    (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &activeBlocksPerSM, histogram_range_kernel, kBlockThreads, 0);
 
-    // Number of blocks needed to cover all elements (grid-stride loop will handle rest).
-    unsigned int blocksNeeded = (inputSize + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-
-    // Cap the number of blocks to avoid extreme oversubscription.
-    // Using up to 32 blocks per SM is typically sufficient for full occupancy.
-    unsigned int maxBlocks = props.multiProcessorCount * 32;
-    unsigned int blocks = (blocksNeeded > maxBlocks) ? maxBlocks : blocksNeeded;
-    if (blocks == 0) {
-        blocks = 1;
+    if (smCount < 1) {
+        smCount = 1;
+    }
+    if (activeBlocksPerSM < 1) {
+        activeBlocksPerSM = 1;
     }
 
-    // Compute warps per block and shared memory size for per-warp histograms.
-    const int warpsPerBlock = (THREADS_PER_BLOCK + props.warpSize - 1) / props.warpSize;
-    const size_t sharedMemSize =
-        static_cast<size_t>(rangeLen) *
-        static_cast<size_t>(warpsPerBlock) *
-        sizeof(unsigned int);
+    const unsigned int maxResidentBlocks =
+        static_cast<unsigned int>(smCount) * static_cast<unsigned int>(activeBlocksPerSM);
 
-    // Launch the kernel. Caller is responsible for checking errors and synchronizing.
-    histogram_kernel<<<blocks, THREADS_PER_BLOCK, sharedMemSize>>>(
-        input, histogram, inputSize, from, to);
+    const unsigned int logicalBlocks = ceil_div_u32(inputSize, kTargetBytesPerBlock);
+    unsigned int grid = (logicalBlocks < maxResidentBlocks) ? logicalBlocks : maxResidentBlocks;
+    if (grid == 0u) {
+        grid = 1u;
+    }
+
+    histogram_range_kernel<<<grid, kBlockThreads>>>(
+        input,
+        histogram,
+        inputSize,
+        static_cast<unsigned int>(from),
+        numBins);
 }

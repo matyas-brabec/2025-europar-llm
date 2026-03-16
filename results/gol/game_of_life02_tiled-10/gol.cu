@@ -2,231 +2,246 @@
 #include <cuda_runtime.h>
 
 /*
- * Bit layout and tiling:
- *
- * - The full grid is grid_dimensions x grid_dimensions cells.
- * - grid_dimensions is a power of two, >= 512, and divisible by 8.
- * - Cells are grouped into 8x8 tiles. Each tile is stored in one std::uint64_t.
- * - Tiles are laid out in row-major order:
- *       tile_index = tile_y * tiles_per_dim + tile_x,
- *   where tiles_per_dim = grid_dimensions / 8.
- *
- * - Within a tile (8x8 cells), bits are laid out row-major:
- *       bit_index = local_row * 8 + local_col,
- *   where local_row, local_col in [0, 7].
- *   bit 0 is the top-left cell of the tile, bit 7 is top-right, bits 8..15 are the second row, etc.
- *
- * Boundary handling:
- * - Any cell outside the global grid is considered dead (0).
- * - Tiles outside the grid are treated as 0 (all cells dead).
- */
+  High-throughput Conway step for the exact packed layout described in the prompt.
 
-/**
- * @brief Extracts an 8-bit row from a tile word and extends it to 10 bits
- *        by prepending the rightmost bit of the left tile row and appending
- *        the leftmost bit of the right tile row.
- *
- * @param center_word Tile word containing the 8-bit center row.
- * @param left_word   Tile word containing the 8-bit left neighbor row (or 0 if none).
- * @param right_word  Tile word containing the 8-bit right neighbor row (or 0 if none).
- * @param row_in_tile Row index within the tile [0,7].
- *
- * @return 10-bit row in a uint16_t:
- *         bit 0   = left tile's column 7,
- *         bits 1-8 = center tile's columns 0-7,
- *         bit 9   = right tile's column 0.
- */
-static __device__ __forceinline__
-std::uint16_t make_extended_row(std::uint64_t center_word,
-                                std::uint64_t left_word,
-                                std::uint64_t right_word,
-                                int row_in_tile)
-{
-    // Extract 8-bit rows from each tile word.
-    std::uint8_t center_row = static_cast<std::uint8_t>((center_word >> (row_in_tile * 8)) & 0xFFu);
-    std::uint8_t left_row   = static_cast<std::uint8_t>((left_word   >> (row_in_tile * 8)) & 0xFFu);
-    std::uint8_t right_row  = static_cast<std::uint8_t>((right_word  >> (row_in_tile * 8)) & 0xFFu);
+  Assumed memory layout (the natural interpretation of "one uint64_t stores one 8x8 tile"):
+    - Tiles are stored in row-major order across the whole grid.
+    - Inside each 64-bit tile, bit (8 * local_y + local_x) is the cell at (local_y, local_x).
+    - local_x == 0 is the least-significant bit of each byte, local_x == 7 the most-significant.
 
-    // Bits 1..8 = center_row bits 0..7.
-    std::uint16_t extended = static_cast<std::uint16_t>(center_row) << 1;
-    // Bit 0 = bit 7 of the left row (neighbor to the left of column 0).
-    extended |= static_cast<std::uint16_t>((left_row >> 7) & 1u);
-    // Bit 9 = bit 0 of the right row (neighbor to the right of column 7).
-    extended |= static_cast<std::uint16_t>(right_row & 1u) << 9;
+  Design choices tuned for modern data-center GPUs (A100/H100 class):
+    - One thread updates one 8x8 tile, i.e. 64 cells at once in pure bit-parallel form.
+    - blockDim.x is fixed to 32 so each warp spans 32 consecutive tiles of one tile row.
+      West/east neighbor tiles are therefore exchanged with warp shuffles instead of extra
+      global loads; each thread only loads its N/C/S tiles from memory, plus two boundary
+      threads per warp perform the missing edge loads.
+    - No shared memory / texture memory: for this representation they add complexity without
+      helping enough; the reduced load count plus normal caches are sufficient.
+    - Neighbor counts are accumulated with a SWAR half-adder tree over eight 64-bit neighbor
+      bit-planes. Only the low three count bits are required:
+        count == bit0 + 2*bit1 + 4*bit2   (mod 8)
+      The only discarded overflow case is count==8 -> 0 mod 8, which is harmless because
+      Conway's rules only care about counts 2 and 3.
+    - Input and output are assumed to be distinct ping-pong buffers.
+*/
 
-    return extended;
+namespace {
+
+using u64 = std::uint64_t;
+
+constexpr int kTileShift = 3;   // 8x8 tile
+constexpr int kBlockX    = 32;  // exactly one warp in x
+constexpr int kSmallBlockY = 4; // keeps enough blocks for the smallest legal grid (1024x1024)
+constexpr int kLargeBlockY = 8; // slightly lower launch overhead for larger grids
+
+static_assert(kBlockX == 32, "This kernel relies on one warp spanning exactly one tile stripe.");
+
+constexpr u64 kCol0Mask    = 0x0101010101010101ULL; // local_x == 0 in every row byte
+constexpr u64 kCol7Mask    = 0x8080808080808080ULL; // local_x == 7 in every row byte
+constexpr u64 kNotCol0Mask = 0xFEFEFEFEFEFEFEFEULL;
+constexpr u64 kNotCol7Mask = 0x7F7F7F7F7F7F7F7FULL;
+
+__device__ __forceinline__ u64 shfl_up_1(const u64 v) {
+    return static_cast<u64>(
+        __shfl_up_sync(0xFFFFFFFFu, static_cast<unsigned long long>(v), 1, 32)
+    );
 }
 
-/**
- * @brief CUDA kernel implementing one step of Conway's Game of Life on a bit-packed grid.
- *
- * Each thread processes one 8x8 tile (one std::uint64_t).
- * Neighbor information is gathered from up to 9 surrounding tiles (3x3 tile neighborhood).
- * Within each tile, the kernel iterates over the 8x8 cells, computing neighbor counts and
- * the next state using bit operations.
- */
-static __global__ void game_of_life_kernel(const std::uint64_t* __restrict__ input,
-                                           std::uint64_t* __restrict__ output,
-                                           int grid_dim)
-{
-    constexpr int TILE_SIZE = 8;
-    const int tiles_per_dim = grid_dim >> 3;  // grid_dim / 8
+__device__ __forceinline__ u64 shfl_down_1(const u64 v) {
+    return static_cast<u64>(
+        __shfl_down_sync(0xFFFFFFFFu, static_cast<unsigned long long>(v), 1, 32)
+    );
+}
 
-    const int tile_x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int tile_y = blockIdx.y * blockDim.y + threadIdx.y;
+__device__ __forceinline__ void half_add(const u64 a, const u64 b, u64& sum, u64& carry) {
+    sum   = a ^ b;
+    carry = a & b;
+}
 
-    if (tile_x >= tiles_per_dim || tile_y >= tiles_per_dim)
-        return;
+__device__ __forceinline__ u64 majority3(const u64 a, const u64 b, const u64 c) {
+    // 3-input majority; modern compilers map this kind of boolean expression to LOP3.
+    return (a & b) | (c & (a | b));
+}
 
-    const std::size_t idx_center = static_cast<std::size_t>(tile_y) * tiles_per_dim + tile_x;
+template <int BLOCK_Y>
+__global__ __launch_bounds__(kBlockX * BLOCK_Y)
+void game_of_life_kernel(const u64* __restrict__ input,
+                         u64* __restrict__ output,
+                         int tiles_per_dim) {
+    static_assert(BLOCK_Y == kSmallBlockY || BLOCK_Y == kLargeBlockY,
+                  "Only tuned block heights are supported.");
 
-    // Load the 3x3 neighborhood of tiles around (tile_y, tile_x).
-    // Missing neighbors are represented as 0 (all cells dead).
-    const std::uint64_t tile_c  = input[idx_center];
-    const std::uint64_t tile_l  = (tile_x > 0) ? input[idx_center - 1] : 0ull;
-    const std::uint64_t tile_r  = (tile_x + 1 < tiles_per_dim) ? input[idx_center + 1] : 0ull;
+    const int tx = static_cast<int>(blockIdx.x * kBlockX + threadIdx.x);
+    const int ty = static_cast<int>(blockIdx.y * BLOCK_Y + threadIdx.y);
+    const int idx = ty * tiles_per_dim + tx;
 
-    const std::uint64_t tile_u  = (tile_y > 0) ? input[idx_center - tiles_per_dim] : 0ull;
-    const std::uint64_t tile_d  = (tile_y + 1 < tiles_per_dim) ? input[idx_center + tiles_per_dim] : 0ull;
+    const int last_tile = tiles_per_dim - 1;
+    const bool has_n = (ty != 0);
+    const bool has_s = (ty != last_tile);
+    const bool has_w = (tx != 0);
+    const bool has_e = (tx != last_tile);
 
-    const std::uint64_t tile_ul = (tile_x > 0 && tile_y > 0)
-                                  ? input[idx_center - tiles_per_dim - 1] : 0ull;
-    const std::uint64_t tile_ur = (tile_x + 1 < tiles_per_dim && tile_y > 0)
-                                  ? input[idx_center - tiles_per_dim + 1] : 0ull;
+    const unsigned lane = threadIdx.x;
 
-    const std::uint64_t tile_dl = (tile_x > 0 && tile_y + 1 < tiles_per_dim)
-                                  ? input[idx_center + tiles_per_dim - 1] : 0ull;
-    const std::uint64_t tile_dr = (tile_x + 1 < tiles_per_dim && tile_y + 1 < tiles_per_dim)
-                                  ? input[idx_center + tiles_per_dim + 1] : 0ull;
+    // Center column of the 3x3 tile neighborhood. Top/bottom boundaries are zeroed
+    // because cells outside the grid are defined to be dead.
+    const u64 c = input[idx];
+    const u64 n = has_n ? input[idx - tiles_per_dim] : 0ULL;
+    const u64 s = has_s ? input[idx + tiles_per_dim] : 0ULL;
 
-    std::uint64_t new_tile = 0ull;
+    // Warp-local west/east tiles. Because blockDim.x == 32, each warp is exactly one
+    // horizontal tile stripe. Interior lanes get W/E from shuffle; lane 0 / 31 patch
+    // the missing values with a single extra global load each.
+    u64 c_w = shfl_up_1(c);
+    u64 c_e = shfl_down_1(c);
+    u64 n_w = shfl_up_1(n);
+    u64 n_e = shfl_down_1(n);
+    u64 s_w = shfl_up_1(s);
+    u64 s_e = shfl_down_1(s);
 
-    const int global_y_base = tile_y * TILE_SIZE;
-    const int grid_dim_minus1 = grid_dim - 1;
-
-    // Process each of the 8 rows in this tile.
-#pragma unroll
-    for (int local_row = 0; local_row < TILE_SIZE; ++local_row)
-    {
-        const int gy = global_y_base + local_row; // global Y coordinate of this row
-
-        // Build the extended row for the current row (mid).
-        const std::uint16_t row_mid = make_extended_row(tile_c, tile_l, tile_r, local_row);
-
-        // Build extended row for the row above (row_up). If gy == 0, there is no above row.
-        std::uint16_t row_up = 0;
-        if (gy > 0)
-        {
-            if (local_row > 0)
-            {
-                // Above row is within the same tile.
-                row_up = make_extended_row(tile_c, tile_l, tile_r, local_row - 1);
-            }
-            else
-            {
-                // local_row == 0: above row is the last row (row 7) of the tiles above.
-                row_up = make_extended_row(tile_u, tile_ul, tile_ur, TILE_SIZE - 1);
-            }
-        }
-
-        // Build extended row for the row below (row_down). If gy == grid_dim-1, no below row.
-        std::uint16_t row_down = 0;
-        if (gy < grid_dim_minus1)
-        {
-            if (local_row < TILE_SIZE - 1)
-            {
-                // Below row is within the same tile.
-                row_down = make_extended_row(tile_c, tile_l, tile_r, local_row + 1);
-            }
-            else
-            {
-                // local_row == 7: below row is the first row (row 0) of the tiles below.
-                row_down = make_extended_row(tile_d, tile_dl, tile_dr, 0);
-            }
-        }
-
-        // Current row's 8 cells from the center tile.
-        const std::uint8_t center_row_bits =
-            static_cast<std::uint8_t>((tile_c >> (local_row * 8)) & 0xFFu);
-
-        std::uint8_t new_row_bits = 0u;
-
-        // Compute the next state for each column in this row.
-#pragma unroll
-        for (int col = 0; col < TILE_SIZE; ++col)
-        {
-            /*
-             * For the cell at (gy, gx) where gx = tile_x * 8 + col,
-             * the neighbors are:
-             * - Above row: up-left, up, up-right      -> row_up bits [col..col+2]
-             * - Same row: left, right                 -> row_mid bits [col] and [col+2]
-             * - Below row: down-left, down, down-right-> row_down bits [col..col+2]
-             *
-             * row_mid bit layout for this row:
-             *   bit (col)   = left neighbor
-             *   bit (col+1) = self (center cell)
-             *   bit (col+2) = right neighbor
-             *
-             * We pack these 8 neighbor bits into a byte and count them using __popc.
-             */
-
-            std::uint8_t neighborhood = 0u;
-
-            // Upper 3 neighbors -> bits 0..2.
-            neighborhood |= static_cast<std::uint8_t>((row_up >> col) & 0x7u);
-
-            // Same-row left neighbor -> bit 3.
-            neighborhood |= static_cast<std::uint8_t>(((row_mid >> col) & 0x1u) << 3);
-
-            // Same-row right neighbor -> bit 4.
-            neighborhood |= static_cast<std::uint8_t>(((row_mid >> (col + 2)) & 0x1u) << 4);
-
-            // Lower 3 neighbors -> bits 5..7.
-            neighborhood |= static_cast<std::uint8_t>(((row_down >> col) & 0x7u) << 5);
-
-            const unsigned neighbor_count = __popc(static_cast<unsigned>(neighborhood));
-
-            const unsigned cell_alive = (center_row_bits >> col) & 0x1u;
-
-            // Conway's Game of Life rules:
-            // - A live cell survives if it has 2 or 3 neighbors.
-            // - A dead cell becomes alive if it has exactly 3 neighbors.
-            const unsigned survive = (cell_alive & (neighbor_count == 2u));
-            const unsigned born    = (neighbor_count == 3u);
-            const unsigned next_alive = survive | born;
-
-            new_row_bits |= static_cast<std::uint8_t>(next_alive << col);
-        }
-
-        // Store the updated 8-bit row back into the 64-bit tile word.
-        new_tile |= static_cast<std::uint64_t>(new_row_bits) << (local_row * 8);
+    if (lane == 0u) {
+        c_w = has_w ? input[idx - 1] : 0ULL;
+        n_w = (has_w && has_n) ? input[idx - tiles_per_dim - 1] : 0ULL;
+        s_w = (has_w && has_s) ? input[idx + tiles_per_dim - 1] : 0ULL;
+    }
+    if (lane == 31u) {
+        c_e = has_e ? input[idx + 1] : 0ULL;
+        n_e = (has_e && has_n) ? input[idx - tiles_per_dim + 1] : 0ULL;
+        s_e = (has_e && has_s) ? input[idx + tiles_per_dim + 1] : 0ULL;
     }
 
-    output[idx_center] = new_tile;
+    // Align the eight neighbor directions to the current tile's 64 bit positions.
+    //
+    // north/south:
+    //   shift by 8 bits (one row) and inject the bordering row from the adjacent tile.
+    //
+    // west/east:
+    //   shift within each byte (one column) while masking row wrap, and inject the
+    //   bordering column from the adjacent tile.
+    //
+    // diagonals:
+    //   derived from aligned north/south plus the missing border column coming from the
+    //   west/east or diagonal tiles.
+    const u64 north = (c << 8) | (n >> 56);
+    const u64 south = (c >> 8) | (s << 56);
+
+    // Pair 0: north + south.
+    u64 lo0, hi0;
+    half_add(north, south, lo0, hi0);
+
+    const u64 cw7 = c_w & kCol7Mask;
+    const u64 ce0 = c_e & kCol0Mask;
+
+    // Pair 1: west + east.
+    u64 lo1, hi1;
+    {
+        const u64 west = ((c & kNotCol7Mask) << 1) | (cw7 >> 7);
+        const u64 east = ((c & kNotCol0Mask) >> 1) | (ce0 << 7);
+        half_add(west, east, lo1, hi1);
+    }
+
+    const u64 north_l = (north & kNotCol7Mask) << 1; // NW internal part
+    const u64 north_r = (north & kNotCol0Mask) >> 1; // NE internal part
+    const u64 south_l = (south & kNotCol7Mask) << 1; // SW internal part
+    const u64 south_r = (south & kNotCol0Mask) >> 1; // SE internal part
+
+    // Pair 2: northwest + northeast.
+    u64 lo2, hi2;
+    {
+        const u64 northwest = north_l | (cw7 << 1) | ((n_w & kCol7Mask) >> 63);
+        const u64 northeast = north_r | (ce0 << 15) | ((n_e & kCol0Mask) >> 49);
+        half_add(northwest, northeast, lo2, hi2);
+    }
+
+    // Pair 3: southwest + southeast.
+    u64 lo3, hi3;
+    {
+        const u64 southwest = south_l | (cw7 >> 15) | ((s_w & kCol7Mask) << 49);
+        const u64 southeast = south_r | (ce0 >> 1) | ((s_e & kCol0Mask) << 63);
+        half_add(southwest, southeast, lo3, hi3);
+    }
+
+    // Sum the four 2-bit partial sums:
+    //   lo* are the weight-1 bits, hi* are the weight-2 bits.
+    //
+    // Final count bits are:
+    //   count = count0 + 2*count1 + 4*count2   (mod 8)
+    //
+    // The discarded bit-3 overflow only represents count==8, which is irrelevant for
+    // Conway's rule evaluation because only counts 2 and 3 can produce a live output.
+    u64 s01, c01;
+    u64 s23, c23;
+    half_add(lo0, lo1, s01, c01);
+    half_add(lo2, lo3, s23, c23);
+
+    const u64 count0 = s01 ^ s23;
+    const u64 carry0 = s01 & s23;
+    const u64 mid1   = carry0 ^ c01 ^ c23;
+    const u64 mid2   = majority3(carry0, c01, c23);
+
+    u64 t01, u01;
+    u64 t23, u23;
+    half_add(hi0, hi1, t01, u01);
+    half_add(hi2, hi3, t23, u23);
+
+    const u64 q0 = t01 ^ t23;
+    const u64 q1 = (t01 & t23) ^ u01 ^ u23;
+
+    const u64 count1 = mid1 ^ q0;
+    const u64 count2 = mid2 ^ q1 ^ (mid1 & q0);
+
+    // Conway's rule in bit-sliced form:
+    //   next = (count == 3) | (current & (count == 2))
+    //
+    // Using the count bit-planes:
+    //   count==2 or 3  <=>  count1==1 and count2==0
+    //   count==3       <=>  above and count0==1
+    //
+    // So:
+    //   next = (count1 & ~count2) & (count0 | current)
+    const u64 two_or_three = count1 & ~count2;
+    output[idx] = two_or_three & (count0 | c);
 }
 
-/**
- * @brief Host wrapper that launches the CUDA kernel for one step of Conway's Game of Life.
- *
- * @param input           Device pointer to the input grid (bit-packed, 8x8 tiles per std::uint64_t).
- * @param output          Device pointer to the output grid (same layout as input).
- * @param grid_dimensions Width and height of the square grid (power of two, multiple of 8).
- *
- * The function does not synchronize; the caller is responsible for any needed synchronization.
- */
+template <int BLOCK_Y>
+inline void launch_game_of_life_kernel(const u64* input, u64* output, int tiles_per_dim) {
+    const dim3 block(kBlockX, BLOCK_Y, 1);
+    const dim3 grid(
+        static_cast<unsigned int>(tiles_per_dim / kBlockX),
+        static_cast<unsigned int>(tiles_per_dim / BLOCK_Y),
+        1
+    );
+    game_of_life_kernel<BLOCK_Y><<<grid, block>>>(input, output, tiles_per_dim);
+}
+
+} // namespace
+
 void run_game_of_life(const std::uint64_t* input,
                       std::uint64_t* output,
-                      int grid_dimensions)
-{
-    constexpr int TILE_SIZE = 8;
-    const int tiles_per_dim = grid_dimensions >> 3; // grid_dimensions / 8
+                      int grid_dimensions) {
+    // The prompt guarantees:
+    //   - square grid
+    //   - power-of-two dimensions
+    //   - grid_dimensions > 512
+    //
+    // Therefore tiles_per_dim = grid_dimensions / 8 is also a power of two and is
+    // always divisible by both 32 and the chosen BLOCK_Y, so the launch needs no tail
+    // predicates and the kernel contains no output bounds checks.
+    const int tiles_per_dim = grid_dimensions >> kTileShift;
 
-    // Configure a 2D grid of thread blocks. Each thread processes one tile (one std::uint64_t).
-    dim3 block_dim(16, 16);
-    dim3 grid_dim((tiles_per_dim + block_dim.x - 1) / block_dim.x,
-                  (tiles_per_dim + block_dim.y - 1) / block_dim.y);
+    // Smallest legal grid is 1024x1024 => 128x128 tiles.
+    // With BLOCK_Y=8 that would be only 64 blocks total, which underutilizes A100/H100.
+    // Use a 4-row block there; otherwise use 8-row blocks to slightly reduce launch and
+    // scheduling overhead.
+    if (tiles_per_dim <= 128) {
+        launch_game_of_life_kernel<kSmallBlockY>(input, output, tiles_per_dim);
+    } else {
+        launch_game_of_life_kernel<kLargeBlockY>(input, output, tiles_per_dim);
+    }
 
-    game_of_life_kernel<<<grid_dim, block_dim>>>(input, output, grid_dimensions);
+    // Intentionally no synchronization and no error checking here:
+    // the caller is responsible for synchronization, and avoiding extra host overhead
+    // keeps the step launch as lean as possible.
 }
 
 // The content below was not generated by GPT; it was added to ensure the framework can compile the code.

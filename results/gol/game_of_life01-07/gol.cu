@@ -1,219 +1,252 @@
 #include <cuda_runtime.h>
-#include <cstdint>
-#include <cstddef>
 
-static_assert(sizeof(bool) == 1, "This implementation assumes bool is 1 byte.");
+namespace {
 
-// Tunable block dimensions. These are chosen to give good occupancy and memory coalescing
-// on modern NVIDIA data-center GPUs (A100/H100).
-#ifndef GOL_BLOCK_DIM_X
-#define GOL_BLOCK_DIM_X 32
-#endif
+/*
+  Optimized one-step Conway's Game of Life for large square grids on modern NVIDIA GPUs.
 
-#ifndef GOL_BLOCK_DIM_Y
-#define GOL_BLOCK_DIM_Y 16
-#endif
+  Performance-oriented design:
+  - Split the problem into a large interior and a tiny boundary. The boundary is O(n),
+    so it is handled by a separate simple kernel to keep the hot interior path free of
+    per-cell boundary checks.
+  - The interior kernel is warp-centric:
+      * each warp covers 32 consecutive x positions,
+      * horizontal neighbors are exchanged with warp shuffles,
+      * each thread walks a short strip of rows in y and keeps a 3-row rolling window
+        entirely in registers.
+    This keeps global memory traffic close to the minimum while avoiding shared-memory
+    tiling for byte cells (which would otherwise either bank-conflict or force a 4x
+    expansion to 32-bit storage).
+  - grid.y is capped and processed with a grid-stride loop, so very large grids do not
+    launch millions of tiny blocks.
 
-// CUDA kernel implementing one step of Conway's Game of Life.
-// Each thread updates one cell. The grid is square (N x N), where N is a power of 2 > 512.
-// The grid is divided into 2D blocks of size GOL_BLOCK_DIM_X x GOL_BLOCK_DIM_Y.
-// Shared memory tiling is used to minimize global memory traffic: each block loads a
-// (GOL_BLOCK_DIM_X+2) x (GOL_BLOCK_DIM_Y+2) tile, including a 1-cell halo on all sides.
-//
-// Boundary handling: cells outside the grid are considered dead (0). This is enforced
-// when loading halo values into shared memory.
-__global__ __launch_bounds__(GOL_BLOCK_DIM_X * GOL_BLOCK_DIM_Y, 2)
-void game_of_life_kernel(const unsigned char* __restrict__ input,
-                         unsigned char* __restrict__ output,
-                         int N)
-{
-    // Shared memory tile:
-    // - X dimension: [0 .. GOL_BLOCK_DIM_X+1]
-    // - Y dimension: [0 .. GOL_BLOCK_DIM_Y+1]
-    // Indices 1..GOL_BLOCK_DIM_X and 1..GOL_BLOCK_DIM_Y store the "interior" cells for this block.
-    // Index 0 and GOL_BLOCK_DIM_X+1 / GOL_BLOCK_DIM_Y+1 are the halo (neighbor) cells.
-    //
-    // Using 32-bit ints for shared cells avoids shared-memory bank conflicts on modern GPUs.
-    __shared__ unsigned int tile[GOL_BLOCK_DIM_Y + 2][GOL_BLOCK_DIM_X + 2];
+  Storage note:
+  - The caller supplies bool buffers in device memory. CUDA device bool storage is 1 byte,
+    so the buffers are safely aliased as bytes here and the kernels write canonical 0/1.
+*/
 
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
+static_assert(sizeof(bool) == 1, "This implementation assumes 1-byte bool storage.");
 
-    const int x = blockIdx.x * GOL_BLOCK_DIM_X + tx;
-    const int y = blockIdx.y * GOL_BLOCK_DIM_Y + ty;
+using cell_t = unsigned char;
 
-    const int sx = tx + 1;  // Shared memory X index (shifted by +1 for halo)
-    const int sy = ty + 1;  // Shared memory Y index
+constexpr int      kWarpSize        = 32;
+constexpr int      kWarpsPerBlock   = 4;    // 128 threads/block keeps enough blocks even at 1024x1024.
+constexpr int      kInteriorThreads = kWarpSize * kWarpsPerBlock;
+constexpr int      kRowsPerStrip    = 16;   // Good reuse/occupancy balance on A100/H100 class GPUs.
+constexpr int      kBoundaryThreads = 256;
+constexpr int      kMaxGridY        = 128;  // Cap grid.y; the interior kernel grid-strides in y.
+constexpr unsigned kFullMask        = 0xffffffffu;
 
-    const size_t pitch = static_cast<size_t>(N);
-    const size_t center_idx = static_cast<size_t>(y) * pitch + static_cast<size_t>(x);
-
-    // Load center cell for this thread into shared memory.
-    // All (x, y) are guaranteed to be valid because N is a power of 2 > 512 and the block
-    // dimensions divide N (32 and 16 are powers of 2), so there are no partial blocks.
-    unsigned int center = static_cast<unsigned int>(input[center_idx]);
-    tile[sy][sx] = center;
-
-    // Load left halo (one extra column at shared-memory X index 0).
-    if (tx == 0)
-    {
-        unsigned int left = 0u;
-        if (x > 0)
-        {
-            left = static_cast<unsigned int>(input[center_idx - 1]);
-        }
-        tile[sy][0] = left;
-    }
-
-    // Load right halo (one extra column at shared-memory X index GOL_BLOCK_DIM_X + 1).
-    if (tx == GOL_BLOCK_DIM_X - 1)
-    {
-        unsigned int right = 0u;
-        if (x + 1 < N)
-        {
-            right = static_cast<unsigned int>(input[center_idx + 1]);
-        }
-        tile[sy][GOL_BLOCK_DIM_X + 1] = right;
-    }
-
-    // Load top halo (one extra row at shared-memory Y index 0).
-    if (ty == 0)
-    {
-        unsigned int top = 0u;
-        if (y > 0)
-        {
-            const size_t top_idx = center_idx - pitch;
-            top = static_cast<unsigned int>(input[top_idx]);
-        }
-        tile[0][sx] = top;
-    }
-
-    // Load bottom halo (one extra row at shared-memory Y index GOL_BLOCK_DIM_Y + 1).
-    if (ty == GOL_BLOCK_DIM_Y - 1)
-    {
-        unsigned int bottom = 0u;
-        if (y + 1 < N)
-        {
-            const size_t bottom_idx = center_idx + pitch;
-            bottom = static_cast<unsigned int>(input[bottom_idx]);
-        }
-        tile[GOL_BLOCK_DIM_Y + 1][sx] = bottom;
-    }
-
-    // Load the four corner halo cells. Only four threads per block execute these branches:
-    // top-left, top-right, bottom-left, bottom-right of the block.
-    if (tx == 0 && ty == 0)
-    {
-        unsigned int val = 0u;
-        if (x > 0 && y > 0)
-        {
-            const size_t idx = center_idx - pitch - 1;
-            val = static_cast<unsigned int>(input[idx]);
-        }
-        tile[0][0] = val;
-    }
-
-    if (tx == GOL_BLOCK_DIM_X - 1 && ty == 0)
-    {
-        unsigned int val = 0u;
-        if (x + 1 < N && y > 0)
-        {
-            const size_t idx = center_idx - pitch + 1;
-            val = static_cast<unsigned int>(input[idx]);
-        }
-        tile[0][GOL_BLOCK_DIM_X + 1] = val;
-    }
-
-    if (tx == 0 && ty == GOL_BLOCK_DIM_Y - 1)
-    {
-        unsigned int val = 0u;
-        if (x > 0 && y + 1 < N)
-        {
-            const size_t idx = center_idx + pitch - 1;
-            val = static_cast<unsigned int>(input[idx]);
-        }
-        tile[GOL_BLOCK_DIM_Y + 1][0] = val;
-    }
-
-    if (tx == GOL_BLOCK_DIM_X - 1 && ty == GOL_BLOCK_DIM_Y - 1)
-    {
-        unsigned int val = 0u;
-        if (x + 1 < N && y + 1 < N)
-        {
-            const size_t idx = center_idx + pitch + 1;
-            val = static_cast<unsigned int>(input[idx]);
-        }
-        tile[GOL_BLOCK_DIM_Y + 1][GOL_BLOCK_DIM_X + 1] = val;
-    }
-
-    // Ensure all shared-memory loads are visible before computing neighbor sums.
-    __syncthreads();
-
-    // Compute the sum of the eight neighbors from shared memory.
-    // We do not include the center cell in the sum.
-    const unsigned int n00 = tile[sy - 1][sx - 1];
-    const unsigned int n01 = tile[sy - 1][sx    ];
-    const unsigned int n02 = tile[sy - 1][sx + 1];
-    const unsigned int n10 = tile[sy    ][sx - 1];
-    const unsigned int n12 = tile[sy    ][sx + 1];
-    const unsigned int n20 = tile[sy + 1][sx - 1];
-    const unsigned int n21 = tile[sy + 1][sx    ];
-    const unsigned int n22 = tile[sy + 1][sx + 1];
-
-    const unsigned int neighbor_sum =
-        n00 + n01 + n02 +
-        n10 +        n12 +
-        n20 + n21 + n22;
-
-    // Conway's Game of Life update rule:
-    // - Any live cell with 2 or 3 live neighbors survives.
-    // - Any dead cell with exactly 3 live neighbors becomes alive.
-    // - All other cells die or stay dead.
-    //
-    // Expressed in boolean algebra:
-    //   new_state = (neighbor_sum == 3) || (center == 1 && neighbor_sum == 2)
-    //
-    // We implement this using integer arithmetic to avoid branches:
-    //   new_state = (neighbor_sum == 3) | (center & (neighbor_sum == 2))
-    const unsigned int is_three = (neighbor_sum == 3);
-    const unsigned int is_two   = (neighbor_sum == 2);
-    const unsigned int new_state = (is_three | (center & is_two));
-
-    // Store result back to global memory. Values are 0 or 1.
-    output[center_idx] = static_cast<unsigned char>(new_state);
+__device__ __forceinline__ cell_t apply_life_rule(unsigned int neighbors, unsigned int self) {
+    // neighbors excludes self and self is stored as 0/1.
+    return static_cast<cell_t>((neighbors == 3u) | (self & (neighbors == 2u)));
 }
 
-// Host function that runs one step of Conway's Game of Life on the GPU.
-//
-// Parameters:
-//   input            - device pointer to the input grid of size (grid_dimensions^2),
-//                      with each cell stored as a bool (false = dead, true = alive).
-//   output           - device pointer to the output grid (same layout as input).
-//   grid_dimensions  - width/height of the square grid; always a power of 2 > 512.
-//
-// The input and output arrays must be allocated with cudaMalloc by the caller.
-// No host-device synchronization is performed here; the caller is responsible for
-// synchronizing as needed.
-void run_game_of_life(const bool* input, bool* output, int grid_dimensions)
-{
-    const int N = grid_dimensions;
+__launch_bounds__(kInteriorThreads)
+__global__ void life_interior_strip_kernel(const cell_t* __restrict__ in,
+                                           cell_t* __restrict__ out,
+                                           int n) {
+    // Legal widths are powers of two > 512, so kInteriorThreads=128 divides every legal n.
+    const int tid      = static_cast<int>(threadIdx.x);
+    const int lane     = tid & (kWarpSize - 1);
+    const bool lane0   = (lane == 0);
+    const bool lane31  = (lane == (kWarpSize - 1));
 
-    // Reinterpret bool pointers as unsigned char pointers. In CUDA, bool is 1 byte,
-    // and using unsigned char gives better-defined behavior for arithmetic and
-    // memory operations. This is safe because unsigned char can alias any object.
-    const unsigned char* d_in  = reinterpret_cast<const unsigned char*>(input);
-    unsigned char*       d_out = reinterpret_cast<unsigned char*>(output);
+    const int x        = static_cast<int>(blockIdx.x) * kInteriorThreads + tid;
+    const int last     = n - 1;
 
-    // Because grid_dimensions is always a power of 2 > 512 and the block dimensions
-    // (32 x 16) are powers of 2, N is guaranteed to be divisible by both 32 and 16.
-    // Therefore, we can use exact division here with no partial edge blocks.
-    dim3 block(GOL_BLOCK_DIM_X, GOL_BLOCK_DIM_Y, 1);
-    dim3 grid(static_cast<unsigned int>(N / GOL_BLOCK_DIM_X),
-              static_cast<unsigned int>(N / GOL_BLOCK_DIM_Y),
-              1);
+    // Most threads are interior cells; only the global left/right border lanes suppress stores.
+    const bool write_cell = (x > 0) && (x < last);
 
-    game_of_life_kernel<<<grid, block>>>(d_in, d_out, N);
-    // No cudaDeviceSynchronize() here; caller handles synchronization if needed.
+    // Only warp edge lanes need cross-warp halo columns from global memory.
+    const bool need_left  = lane0  && (x > 0);
+    const bool need_right = lane31 && (x < last);
+
+    const size_t pitch    = static_cast<size_t>(n);
+    const size_t x64      = static_cast<size_t>(x);
+    const int    stride   = n;
+    const int    stride2  = n + n;
+    const int    y_stride = static_cast<int>(gridDim.y) * kRowsPerStrip;
+
+    for (int y0 = static_cast<int>(blockIdx.y) * kRowsPerStrip + 1; y0 < last; y0 += y_stride) {
+        const int remaining  = last - y0;
+        const int valid_rows = (remaining < kRowsPerStrip) ? remaining : kRowsPerStrip;
+
+        const size_t base = static_cast<size_t>(y0 - 1) * pitch + x64;
+
+        // p points at row (y-1), current x. q points at output row y, current x.
+        const cell_t* p = in  + base;
+        cell_t*       q = out + base + pitch;
+
+        // Rolling 3-row window in registers.
+        unsigned int r0 = static_cast<unsigned int>(p[0]);
+        unsigned int r1 = static_cast<unsigned int>(p[stride]);
+        unsigned int r2 = static_cast<unsigned int>(p[stride2]);
+
+        // Cached cross-warp halos for lane 0 / lane 31. They stay zero on the true grid borders.
+        const cell_t* lp = nullptr;
+        const cell_t* rp = nullptr;
+        unsigned int  l0 = 0, l1 = 0, l2 = 0;
+        unsigned int rr0 = 0, rr1 = 0, rr2 = 0;
+
+        if (need_left) {
+            lp = p - 1;
+            l0 = static_cast<unsigned int>(lp[0]);
+            l1 = static_cast<unsigned int>(lp[stride]);
+            l2 = static_cast<unsigned int>(lp[stride2]);
+        }
+        if (need_right) {
+            rp  = p + 1;
+            rr0 = static_cast<unsigned int>(rp[0]);
+            rr1 = static_cast<unsigned int>(rp[stride]);
+            rr2 = static_cast<unsigned int>(rp[stride2]);
+        }
+
+        #pragma unroll
+        for (int i = 0; i < kRowsPerStrip; ++i) {
+            if (i < valid_rows) {
+                // Horizontal neighbors come from the warp. Only the two warp-edge lanes override
+                // with the cached cross-warp halo values loaded above.
+                unsigned int up_l  = __shfl_up_sync  (kFullMask, r0, 1);
+                unsigned int up_r  = __shfl_down_sync(kFullMask, r0, 1);
+                unsigned int mid_l = __shfl_up_sync  (kFullMask, r1, 1);
+                unsigned int mid_r = __shfl_down_sync(kFullMask, r1, 1);
+                unsigned int dn_l  = __shfl_up_sync  (kFullMask, r2, 1);
+                unsigned int dn_r  = __shfl_down_sync(kFullMask, r2, 1);
+
+                if (lane0) {
+                    up_l  = l0;
+                    mid_l = l1;
+                    dn_l  = l2;
+                }
+                if (lane31) {
+                    up_r  = rr0;
+                    mid_r = rr1;
+                    dn_r  = rr2;
+                }
+
+                if (write_cell) {
+                    const unsigned int neighbors =
+                        (up_l + r0 + up_r) +
+                        (mid_l + mid_r) +
+                        (dn_l + r2 + dn_r);
+
+                    q[0] = apply_life_rule(neighbors, r1);
+                }
+            }
+
+            // Advance the rolling window when another valid row remains in this strip.
+            if ((i + 1) < kRowsPerStrip && (i + 1) < valid_rows) {
+                p += stride;
+                q += stride;
+
+                r0 = r1;
+                r1 = r2;
+                r2 = static_cast<unsigned int>(p[stride2]);
+
+                if (need_left) {
+                    lp += stride;
+                    l0  = l1;
+                    l1  = l2;
+                    l2  = static_cast<unsigned int>(lp[stride2]);
+                }
+                if (need_right) {
+                    rp  += stride;
+                    rr0 = rr1;
+                    rr1 = rr2;
+                    rr2 = static_cast<unsigned int>(rp[stride2]);
+                }
+            }
+        }
+    }
+}
+
+__global__ void life_boundary_kernel(const cell_t* __restrict__ in,
+                                     cell_t* __restrict__ out,
+                                     int n) {
+    // One thread per boundary cell. This is O(n), so simplicity is preferred over further tuning.
+    const int t            = static_cast<int>(blockIdx.x) * kBoundaryThreads + static_cast<int>(threadIdx.x);
+    const int border_count = (n << 2) - 4;
+    if (t >= border_count) {
+        return;
+    }
+
+    const int last            = n - 1;
+    const int two_n           = n << 1;
+    const int three_n_minus_2 = two_n + n - 2;
+
+    int x, y;
+    if (t < n) {
+        x = t;
+        y = 0;
+    } else if (t < two_n) {
+        x = t - n;
+        y = last;
+    } else if (t < three_n_minus_2) {
+        x = 0;
+        y = t - two_n + 1;   // Left column, excluding corners.
+    } else {
+        x = last;
+        y = t - three_n_minus_2 + 1; // Right column, excluding corners.
+    }
+
+    const size_t pitch = static_cast<size_t>(n);
+    const size_t idx   = static_cast<size_t>(y) * pitch + static_cast<size_t>(x);
+    const int    stride = n;
+
+    const cell_t* p = in + idx;
+
+    const bool has_left  = (x > 0);
+    const bool has_right = (x < last);
+    const bool has_up    = (y > 0);
+    const bool has_down  = (y < last);
+
+    unsigned int neighbors = 0;
+
+    if (has_up) {
+        const cell_t* pu = p - stride;
+        if (has_left)  neighbors += static_cast<unsigned int>(pu[-1]);
+        neighbors += static_cast<unsigned int>(pu[0]);
+        if (has_right) neighbors += static_cast<unsigned int>(pu[1]);
+    }
+
+    if (has_left)  neighbors += static_cast<unsigned int>(p[-1]);
+    if (has_right) neighbors += static_cast<unsigned int>(p[1]);
+
+    if (has_down) {
+        const cell_t* pd = p + stride;
+        if (has_left)  neighbors += static_cast<unsigned int>(pd[-1]);
+        neighbors += static_cast<unsigned int>(pd[0]);
+        if (has_right) neighbors += static_cast<unsigned int>(pd[1]);
+    }
+
+    out[idx] = apply_life_rule(neighbors, static_cast<unsigned int>(p[0]));
+}
+
+} // anonymous namespace
+
+void run_game_of_life(const bool* input, bool* output, int grid_dimensions) {
+    // Standard double-buffered semantics are assumed: input and output must not alias.
+    // The caller owns all synchronization; this function intentionally performs no sync
+    // and does not inject host-side launch/error checks into the hot path.
+
+    const cell_t* in  = reinterpret_cast<const cell_t*>(input);
+    cell_t*       out = reinterpret_cast<cell_t*>(output);
+
+    const int x_blocks = grid_dimensions / kInteriorThreads;
+
+    // The interior kernel grid-strides in y, so grid.y is capped to avoid excessive block count
+    // on very large grids while still keeping plenty of concurrency on A100/H100 class devices.
+    const int total_strips = (grid_dimensions - 2 + kRowsPerStrip - 1) / kRowsPerStrip;
+    const int y_blocks     = (total_strips < kMaxGridY) ? total_strips : kMaxGridY;
+
+    life_interior_strip_kernel<<<dim3(static_cast<unsigned>(x_blocks), static_cast<unsigned>(y_blocks), 1),
+                                 dim3(static_cast<unsigned>(kInteriorThreads), 1, 1)>>>(in, out, grid_dimensions);
+
+    const int border_count   = (grid_dimensions << 2) - 4;
+    const int boundary_blocks = (border_count + kBoundaryThreads - 1) / kBoundaryThreads;
+
+    life_boundary_kernel<<<boundary_blocks, kBoundaryThreads>>>(in, out, grid_dimensions);
 }
 
 // The content below was not generated by GPT; it was added to ensure the framework can compile the code.

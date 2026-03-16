@@ -62,7 +62,7 @@ def process_file(file_path):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python remove-extern.py <directory>")
+        print("Usage: python add-other-func-impl.py <directory>")
         sys.exit(1)
 
     directory = sys.argv[1]

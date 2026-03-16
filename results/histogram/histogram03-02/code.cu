@@ -1,120 +1,234 @@
 #include <cuda_runtime.h>
 
-/*
- * CUDA kernel to compute a character histogram for a specified ordinal range [from, to].
- *
- * - input:      pointer to device memory containing the input characters
- * - inputSize:  number of characters in the input buffer
- * - from, to:   inclusive range of character ordinal values (0..255) to histogram
- * - histogram:  pointer to device memory of length (to - from + 1) unsigned ints
- *
- * The kernel uses per-block privatized histograms in shared memory to reduce
- * contention on global memory atomics. Each block:
- *   1. Initializes its shared histogram to zero.
- *   2. Processes a strided portion of the input, updating the shared histogram
- *      with fast shared-memory atomics.
- *   3. After all threads finish, merges the shared histogram into the global
- *      histogram with a small number of global atomic operations.
- */
-__global__ void histogram_kernel(const char* __restrict__ input,
-                                 unsigned int inputSize,
-                                 int from,
-                                 int to,
-                                 unsigned int* __restrict__ histogram)
+namespace {
+
+// 256 threads is a natural fit for a byte histogram:
+// - 8 warps per block gives good occupancy on A100/H100-class GPUs.
+// - the reduction phase can map one thread to one possible output bin because the
+//   requested range size is at most 256.
+constexpr int kBlockThreads      = 256;
+constexpr int kWarpSize          = 32;
+constexpr int kWarpsPerBlock     = kBlockThreads / kWarpSize;
+constexpr int kMaxBins           = 256;          // full unsigned-char domain
+constexpr int kSharedHistEntries = kWarpsPerBlock * kMaxBins;
+constexpr int kSharedInitIters   = kSharedHistEntries / kBlockThreads;
+constexpr int kUnroll            = 4;
+constexpr unsigned int kInvalidKey          = 0xFFFFFFFFu;
+constexpr unsigned int kTargetBytesPerBlock = 16u * 1024u;  // amortize per-block init/flush cost
+
+static_assert(kBlockThreads % kWarpSize == 0,
+              "Block size must be a whole number of warps.");
+static_assert(kBlockThreads == kMaxBins,
+              "This implementation relies on one reducer thread per possible byte value.");
+static_assert(kSharedHistEntries % kBlockThreads == 0,
+              "Shared-histogram init expects an integer number of stores per thread.");
+
+// Warp-aggregated update into a warp-private shared-memory histogram.
+//
+// The key optimization is:
+//   1) each warp owns its own 256-bin shared-memory histogram slice;
+//   2) __match_any_sync() groups lanes with the same target bin;
+//   3) only one leader lane per unique bin performs the increment.
+//
+// Because a warp's histogram slice is private to that warp, once we reduce a bin to a
+// single leader lane there is no same-address inter-thread race left, so the increment
+// is a plain shared-memory add instead of a shared-memory atomic.
+__device__ __forceinline__
+void add_byte_to_warp_hist(const unsigned int value,
+                           const unsigned int from,
+                           const unsigned int numBins,
+                           const unsigned int lane,
+                           unsigned int* __restrict__ warpHist)
 {
-    extern __shared__ unsigned int shared_hist[];
+    const unsigned int active = __activemask();
 
-    const int range = to - from + 1;
+    // Unsigned subtraction gives a cheap range test:
+    // - in range  => bin in [0, numBins)
+    // - out of range below 'from' underflows to a very large unsigned value
+    // - out of range above 'to' also yields bin >= numBins
+    const unsigned int bin   = value - from;
+    const bool valid         = (bin < numBins);
 
-    // Initialize the per-block shared histogram.
-    // Each thread zeroes multiple bins with a strided loop.
-    for (int i = threadIdx.x; i < range; i += blockDim.x) {
-        shared_hist[i] = 0u;
-    }
+    // All active lanes must participate in __match_any_sync(). Lanes that do not map
+    // to the requested range use a sentinel key outside the real bin domain [0, 255].
+    const unsigned int key     = valid ? bin : kInvalidKey;
+    const unsigned int matches = __match_any_sync(active, key);
 
-    __syncthreads();
-
-    // Compute global thread index and grid-stride.
-    const unsigned int globalThreadId = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int totalThreads   = gridDim.x * blockDim.x;
-
-    // Grid-stride loop over the input.
-    for (unsigned int idx = globalThreadId; idx < inputSize; idx += totalThreads) {
-        // Load character and convert to unsigned to avoid sign-extension issues.
-        unsigned char c = static_cast<unsigned char>(input[idx]);
-
-        // Compute bin index relative to 'from'.
-        // Using the unsigned comparison trick to combine the range check into one.
-        int bin = static_cast<int>(c) - from;
-        if (static_cast<unsigned int>(bin) < static_cast<unsigned int>(range)) {
-            // Fast shared-memory atomic add.
-            atomicAdd(&shared_hist[bin], 1u);
-        }
-    }
-
-    __syncthreads();
-
-    // Merge the shared histogram into the global histogram.
-    // Each thread is responsible for multiple bins in a strided loop.
-    for (int i = threadIdx.x; i < range; i += blockDim.x) {
-        unsigned int count = shared_hist[i];
-        if (count > 0u) {
-            atomicAdd(&histogram[i], count);
+    if (valid) {
+        const unsigned int leader = static_cast<unsigned int>(__ffs(matches) - 1);
+        if (lane == leader) {
+            warpHist[bin] += __popc(matches);
         }
     }
 }
 
-/*
- * Host function to launch the histogram kernel.
- *
- * Parameters:
- *   - input:      device pointer to input text (cudaMalloc'ed)
- *   - histogram:  device pointer to histogram array of length (to - from + 1)
- *                 (cudaMalloc'ed by the caller)
- *   - inputSize:  number of characters in the input buffer
- *   - from, to:   inclusive character ordinal range [from, to] to be histogrammed,
- *                 with 0 <= from < to <= 255
- *
- * Behavior:
- *   - The function zeros the output histogram in device memory.
- *   - It launches a CUDA kernel that computes the histogram using shared memory.
- *   - No device synchronization is performed here; the caller is responsible
- *     for synchronization and error checking if desired.
- */
+__global__ __launch_bounds__(kBlockThreads)
+void histogram_range_kernel(const unsigned char* __restrict__ input,
+                            unsigned int* __restrict__ histogram,
+                            unsigned int inputSize,
+                            unsigned int from,
+                            unsigned int numBins)
+{
+    // One private 256-bin histogram per warp.
+    __shared__ unsigned int s_warpHist[kSharedHistEntries];
+
+    const unsigned int tid    = threadIdx.x;
+    const unsigned int lane   = tid & (kWarpSize - 1);
+    const unsigned int warpId = tid >> 5;
+
+    unsigned int* const warpHist = s_warpHist + warpId * kMaxBins;
+
+    // Fixed-size shared footprint (8 warps * 256 bins = 8 KiB). Zeroing the full shared
+    // histogram keeps the kernel simple and avoids dynamic-shared-memory bookkeeping.
+    #pragma unroll
+    for (int i = 0; i < kSharedInitIters; ++i) {
+        s_warpHist[tid + i * kBlockThreads] = 0u;
+    }
+    __syncthreads();
+
+    const unsigned long long inputSize64 = static_cast<unsigned long long>(inputSize);
+    const unsigned long long globalTid   =
+        static_cast<unsigned long long>(blockIdx.x) * kBlockThreads + tid;
+    const unsigned long long gridStride  =
+        static_cast<unsigned long long>(gridDim.x) * kBlockThreads;
+    const unsigned long long loopStride  = gridStride * kUnroll;
+
+    // Grid-stride traversal with modest unrolling to raise ILP without bloating register use.
+    for (unsigned long long base = globalTid; base < inputSize64; base += loopStride) {
+        add_byte_to_warp_hist(static_cast<unsigned int>(input[base]), from, numBins, lane, warpHist);
+
+        const unsigned long long idx1 = base + gridStride;
+        if (idx1 < inputSize64) {
+            add_byte_to_warp_hist(static_cast<unsigned int>(input[idx1]), from, numBins, lane, warpHist);
+        }
+
+        const unsigned long long idx2 = idx1 + gridStride;
+        if (idx2 < inputSize64) {
+            add_byte_to_warp_hist(static_cast<unsigned int>(input[idx2]), from, numBins, lane, warpHist);
+        }
+
+        const unsigned long long idx3 = idx2 + gridStride;
+        if (idx3 < inputSize64) {
+            add_byte_to_warp_hist(static_cast<unsigned int>(input[idx3]), from, numBins, lane, warpHist);
+        }
+    }
+
+    __syncthreads();
+
+    // Because kBlockThreads == 256 and numBins <= 256, each output bin is owned by at most
+    // one thread in the block during the final reduction.
+    if (tid < numBins) {
+        unsigned int sum = 0u;
+
+        #pragma unroll
+        for (int w = 0; w < kWarpsPerBlock; ++w) {
+            sum += s_warpHist[w * kMaxBins + tid];
+        }
+
+        if (gridDim.x == 1) {
+            // Single-block launch: write every output bin directly, including zeros.
+            histogram[tid] = sum;
+        } else if (sum != 0u) {
+            // Multi-block launch: one global atomic per non-zero bin contribution from this block.
+            atomicAdd(histogram + tid, sum);
+        }
+    }
+}
+
+// Cache the maximum resident grid size for the current device.
+// The kernel shape is fixed, so the occupancy result is stable per device.
+inline int max_resident_blocks_for_kernel()
+{
+    thread_local int cachedDevice    = -1;
+    thread_local int cachedGridLimit = 0;
+
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return 1;
+    }
+
+    if (device != cachedDevice || cachedGridLimit <= 0) {
+        int smCount = 1;
+        int activeBlocksPerSm = 1;
+
+        if (cudaDeviceGetAttribute(&smCount,
+                                   cudaDevAttrMultiProcessorCount,
+                                   device) != cudaSuccess || smCount <= 0) {
+            smCount = 1;
+        }
+
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&activeBlocksPerSm,
+                                                          histogram_range_kernel,
+                                                          kBlockThreads,
+                                                          0) != cudaSuccess ||
+            activeBlocksPerSm <= 0) {
+            activeBlocksPerSm = 1;
+        }
+
+        cachedGridLimit = smCount * activeBlocksPerSm;
+        if (cachedGridLimit <= 0) {
+            cachedGridLimit = 1;
+        }
+
+        cachedDevice = device;
+    }
+
+    return cachedGridLimit;
+}
+
+} // namespace
+
+// Enqueues the histogram work on stream 0. The caller is responsible for any later
+// synchronization and error handling, per the requested API contract.
 void run_histogram(const char *input,
                    unsigned int *histogram,
                    unsigned int inputSize,
                    int from,
                    int to)
 {
-    // Assumptions per problem statement:
-    //   0 <= from < to <= 255
-    // Therefore, range is at least 2 and at most 256.
-    const int range = to - from + 1;
+    const unsigned int fromU   = static_cast<unsigned int>(from);
+    const unsigned int numBins = static_cast<unsigned int>(to - from + 1);
+    const size_t histogramBytes = static_cast<size_t>(numBins) * sizeof(unsigned int);
 
-    // Ensure the output histogram starts at zero.
-    // This is asynchronous with respect to the host and ordered with the kernel
-    // launch in the default stream.
-    cudaMemset(histogram, 0, static_cast<size_t>(range) * sizeof(unsigned int));
-
-    // Choose a reasonable block size for modern NVIDIA data-center GPUs.
-    const unsigned int blockSize = 256;
-
-    // Compute an initial grid size based on input size, then clamp to a
-    // maximum 1D grid dimension to remain portable across architectures.
-    unsigned int numBlocks = (inputSize + blockSize - 1) / blockSize;
-    if (numBlocks == 0) {
-        // Handle inputSize == 0 case: still launch one block to run initialization.
-        numBlocks = 1;
-    }
-    const unsigned int maxBlocks = 65535u;
-    if (numBlocks > maxBlocks) {
-        numBlocks = maxBlocks;
+    if (inputSize == 0u) {
+        cudaMemsetAsync(histogram, 0, histogramBytes, 0);
+        return;
     }
 
-    // Shared memory size per block: one unsigned int per histogram bin.
-    const size_t sharedMemSize = static_cast<size_t>(range) * sizeof(unsigned int);
+    // Launch enough blocks to fill the GPU on large inputs, but avoid launching an excessive
+    // number of blocks for small/medium buffers because each block has a fixed histogram
+    // init/reduction cost.
+    const unsigned int blocksForInput =
+        static_cast<unsigned int>(
+            (static_cast<unsigned long long>(inputSize) +
+             static_cast<unsigned long long>(kTargetBytesPerBlock) - 1ull) /
+            static_cast<unsigned long long>(kTargetBytesPerBlock));
 
-    // Launch the kernel.
-    histogram_kernel<<<numBlocks, blockSize, sharedMemSize>>>(input, inputSize, from, to, histogram);
+    const unsigned int maxBlocks =
+        static_cast<unsigned int>(max_resident_blocks_for_kernel());
+
+    unsigned int launchBlocks =
+        (blocksForInput < maxBlocks) ? blocksForInput : maxBlocks;
+
+    if (launchBlocks == 0u) {
+        launchBlocks = 1u;
+    }
+
+    // Multi-block launches accumulate into global memory, so the destination must be zeroed
+    // first. Single-block launches skip the memset because the kernel writes every output bin.
+    if (launchBlocks > 1u) {
+        cudaMemsetAsync(histogram, 0, histogramBytes, 0);
+    }
+
+    // Reinterpret the input as unsigned bytes so values 128..255 are handled by ordinal value,
+    // independent of whether host-side 'char' is signed or unsigned.
+    const unsigned char* const inputBytes =
+        reinterpret_cast<const unsigned char*>(input);
+
+    histogram_range_kernel<<<launchBlocks, kBlockThreads, 0, 0>>>(
+        inputBytes,
+        histogram,
+        inputSize,
+        fromU,
+        numBins);
 }
