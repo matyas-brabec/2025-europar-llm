@@ -119,23 +119,29 @@ def has_fixed_indicator(text: str) -> bool:
     return "🛠️" in cleaned or "🛠" in cleaned
 
 
-def parse_summary_lines(markdown_path: pathlib.Path) -> dict[str, tuple[int, int, int]]:
-    summary: dict[str, tuple[int, int, int]] = {}
-    for line in markdown_path.read_text(encoding="utf-8").splitlines():
-        match = SUMMARY_RE.match(line.strip())
+def parse_summary_sections(markdown_path: pathlib.Path) -> dict[str, dict[str, tuple[int, int, int]]]:
+    sections: dict[str, dict[str, tuple[int, int, int]]] = {}
+    current_section = "default"
+
+    for raw_line in markdown_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("**") and line.endswith("**"):
+            current_section = line.strip("*")
+            sections.setdefault(current_section, {})
+            continue
+
+        match = SUMMARY_RE.match(line)
         if match is None:
             continue
 
-        summary[match.group("symbol")] = (
+        sections.setdefault(current_section, {})
+        sections[current_section][match.group("symbol")] = (
             int(match.group("count")),
             int(match.group("total")),
             int(match.group("percent")),
         )
 
-    if set(summary) != set(STATUS_ORDER):
-        raise ValueError(f"{markdown_path} does not contain all four summary lines")
-
-    return summary
+    return {name: values for name, values in sections.items() if values}
 
 
 def parse_review_tables(
@@ -233,6 +239,36 @@ def aggregate_counts(sections: dict[str, dict[str, list[str]]]) -> Counter[str]:
     return counts
 
 
+def combine_knn_sections(
+    first: dict[str, list[str]], second: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    if first.keys() != second.keys():
+        missing = sorted(first.keys() - second.keys())
+        extra = sorted(second.keys() - first.keys())
+        raise ValueError(f"kNN sections use different testcase sets: missing={missing}, extra={extra}")
+
+    combined: dict[str, list[str]] = {}
+    for testcase in sorted(first):
+        row: list[str] = []
+        if len(first[testcase]) != len(second[testcase]):
+            raise ValueError(f"kNN sections use different row widths for {testcase}")
+
+        for status_a, status_b in zip(first[testcase], second[testcase]):
+            statuses = {status_a, status_b}
+            if STATUS_COMPILE in statuses:
+                row.append(STATUS_COMPILE)
+            elif STATUS_CRASH in statuses:
+                row.append(STATUS_CRASH)
+            elif STATUS_WRONG in statuses:
+                row.append(STATUS_WRONG)
+            else:
+                row.append(STATUS_OK)
+
+        combined[testcase] = row
+
+    return combined
+
+
 def load_fixed_indicator_matrix(
     results_root: pathlib.Path, source_filename: str, expected_sections: dict[str, dict[str, list[str]]]
 ) -> dict[str, dict[str, list[bool]]]:
@@ -257,6 +293,7 @@ def validate_review(
     expected_sections: dict[str, dict[str, list[str]]],
     row_normalizer: Callable[[str], str],
     expected_fixed_sections: dict[str, dict[str, list[bool]]],
+    expected_summary_sections: dict[str, Counter[str]],
 ) -> list[str]:
     errors: list[str] = []
     reported_sections = parse_review_tables(markdown_path, row_normalizer)
@@ -276,21 +313,34 @@ def validate_review(
                 )
             )
 
-    summary = parse_summary_lines(markdown_path)
-    counts = aggregate_counts(expected_sections)
-    total = sum(counts.values())
+    reported_summary_sections = parse_summary_sections(markdown_path)
+    if reported_summary_sections.keys() != expected_summary_sections.keys():
+        missing = sorted(expected_summary_sections.keys() - reported_summary_sections.keys())
+        extra = sorted(reported_summary_sections.keys() - expected_summary_sections.keys())
+        errors.append(f"{markdown_path}: summary section mismatch: missing={missing}, extra={extra}")
+    else:
+        for section_name, counts in expected_summary_sections.items():
+            reported_summary = reported_summary_sections[section_name]
+            if set(reported_summary) != set(STATUS_ORDER):
+                errors.append(f"{markdown_path}:{section_name}: missing one or more summary lines")
+                continue
 
-    for status in STATUS_ORDER:
-        expected_count = counts[status]
-        expected_percent = round_percent(expected_count, total)
-        reported_count, reported_total, reported_percent = summary[status]
+            total = sum(counts.values())
+            for status in STATUS_ORDER:
+                expected_count = counts[status]
+                expected_percent = round_percent(expected_count, total)
+                reported_count, reported_total, reported_percent = reported_summary[status]
 
-        if reported_count != expected_count or reported_total != total or reported_percent != expected_percent:
-            errors.append(
-                f"{markdown_path}: summary mismatch for {status}: "
-                f"reported={reported_count}/{reported_total} ({reported_percent}%) "
-                f"expected={expected_count}/{total} ({expected_percent}%)"
-            )
+                if (
+                    reported_count != expected_count
+                    or reported_total != total
+                    or reported_percent != expected_percent
+                ):
+                    errors.append(
+                        f"{markdown_path}:{section_name}: summary mismatch for {status}: "
+                        f"reported={reported_count}/{reported_total} ({reported_percent}%) "
+                        f"expected={expected_count}/{total} ({expected_percent}%)"
+                    )
 
     return errors
 
@@ -299,7 +349,13 @@ def review_specs(
     repo_root: pathlib.Path,
 ) -> dict[
     str,
-    tuple[pathlib.Path, dict[str, dict[str, list[str]]], dict[str, dict[str, list[bool]]], Callable[[str], str]],
+    tuple[
+        pathlib.Path,
+        dict[str, dict[str, list[str]]],
+        dict[str, dict[str, list[bool]]],
+        dict[str, Counter[str]],
+        Callable[[str], str],
+    ],
 ]:
     measured_times = repo_root / "measured-times"
     reviews = repo_root / "reviews"
@@ -315,6 +371,10 @@ def review_specs(
         "k=1024, n=4'194'304, m=4'096, r=10": load_csv_matrix(measured_times / "knn-1024-blackwell.csv"),
         "k=32, n=4'194'304, m=4'096, r=10": load_csv_matrix(measured_times / "knn-32-blackwell.csv"),
     }
+    knn_sections["Combined across both k choices"] = combine_knn_sections(
+        knn_sections["k=1024, n=4'194'304, m=4'096, r=10"],
+        knn_sections["k=32, n=4'194'304, m=4'096, r=10"],
+    )
     histogram_sections = {"default": histogram_matrix}
     gol_sections = {"default": load_csv_matrix(measured_times / "gol-blackwell.csv")}
 
@@ -323,18 +383,31 @@ def review_specs(
             reviews / "knn.md",
             knn_sections,
             load_fixed_indicator_matrix(results / "knn", "code.cu", knn_sections),
+            {
+                "Summary for k=1024 and k=32": aggregate_counts(
+                    {
+                        "k=1024, n=4'194'304, m=4'096, r=10": knn_sections["k=1024, n=4'194'304, m=4'096, r=10"],
+                        "k=32, n=4'194'304, m=4'096, r=10": knn_sections["k=32, n=4'194'304, m=4'096, r=10"],
+                    }
+                ),
+                "Summary for combined across both k choices": aggregate_counts(
+                    {"Combined across both k choices": knn_sections["Combined across both k choices"]}
+                ),
+            },
             normalize_knn_row,
         ),
         "histogram": (
             reviews / "histogram.md",
             histogram_sections,
             load_fixed_indicator_matrix(results / "histogram", "code.cu", histogram_sections),
+            {"default": aggregate_counts(histogram_sections)},
             normalize_histogram_row,
         ),
         "game-of-life": (
             reviews / "game-of-life.md",
             gol_sections,
             load_fixed_indicator_matrix(results / "gol", "gol.cu", gol_sections),
+            {"default": aggregate_counts(gol_sections)},
             normalize_gol_row,
         ),
     }
@@ -348,23 +421,26 @@ def main() -> int:
 
     all_errors: list[str] = []
     for review_name in selected:
-        markdown_path, expected_sections, expected_fixed_sections, row_normalizer = specs[review_name]
+        markdown_path, expected_sections, expected_fixed_sections, expected_summary_sections, row_normalizer = specs[review_name]
         errors = validate_review(
             markdown_path,
             expected_sections,
             row_normalizer,
             expected_fixed_sections,
+            expected_summary_sections,
         )
         if errors:
             all_errors.extend(errors)
         else:
-            counts = aggregate_counts(expected_sections)
-            total = sum(counts.values())
-            formatted = ", ".join(
-                f"{status}={counts[status]}/{total} ({round_percent(counts[status], total)}%)"
-                for status in STATUS_ORDER
-            )
-            print(f"{markdown_path}: OK [{formatted}]")
+            formatted_sections = []
+            for section_name, counts in expected_summary_sections.items():
+                total = sum(counts.values())
+                formatted = ", ".join(
+                    f"{status}={counts[status]}/{total} ({round_percent(counts[status], total)}%)"
+                    for status in STATUS_ORDER
+                )
+                formatted_sections.append(f"{section_name} [{formatted}]")
+            print(f"{markdown_path}: OK {'; '.join(formatted_sections)}")
 
     if all_errors:
         for error in all_errors:

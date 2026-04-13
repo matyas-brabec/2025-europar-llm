@@ -1,12 +1,14 @@
 #!/bin/bash
 
-script_dir=$(dirname "$0")
+script_dir=$(cd "$(dirname "$0")" && pwd)
 output_dir=$script_dir/graphs
+filtered_knn_data_dir=$output_dir/generated-data
 
 mkdir -p "$output_dir"
 cd "$output_dir" || exit 1
 
-printer_path="$script_dir/../../framework/print-graph.py"
+printer_path="$script_dir/../framework/print-graph.py"
+filtered_knn_script="$script_dir/filter_knn_both_valid.py"
 
 # All Graphs
 args_per_graph=(
@@ -37,6 +39,16 @@ args_per_graph=(
     "knn@single-graph-style@no-paper-print@auto-boundaries ../knn-1024-volta.csv ../knn-1024-volta.reference.csv"
     "knn@single-graph-style@no-paper-print@auto-boundaries ../knn-1024-blackwell.csv ../knn-1024-blackwell.reference.csv"
 
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-32-hopper-both-valid.csv ../knn-32-hopper.reference.csv"
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-32-ampere-both-valid.csv ../knn-32-ampere.reference.csv"
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-32-volta-both-valid.csv ../knn-32-volta.reference.csv"
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-32-blackwell-both-valid.csv ../knn-32-blackwell.reference.csv"
+
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-1024-hopper-both-valid.csv ../knn-1024-hopper.reference.csv"
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-1024-ampere-both-valid.csv ../knn-1024-ampere.reference.csv"
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-1024-volta-both-valid.csv ../knn-1024-volta.reference.csv"
+    "knn@single-graph-style@no-paper-print@auto-boundaries ./generated-data/knn-1024-blackwell-both-valid.csv ../knn-1024-blackwell.reference.csv"
+
     # logaritmic scale
     "hist@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ../histogram-hexdump-ampere.csv ../histogram-hexdump-ampere.reference.csv log-scale_"
     "hist@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ../histogram-hexdump-volta.csv ../histogram-hexdump-volta.reference.csv log-scale_"
@@ -63,6 +75,16 @@ args_per_graph=(
     "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ../knn-1024-volta.csv ../knn-1024-volta.reference.csv log-scale_"
     "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ../knn-1024-blackwell.csv ../knn-1024-blackwell.reference.csv log-scale_"
 
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-32-hopper-both-valid.csv ../knn-32-hopper.reference.csv log-scale_"
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-32-ampere-both-valid.csv ../knn-32-ampere.reference.csv log-scale_"
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-32-volta-both-valid.csv ../knn-32-volta.reference.csv log-scale_"
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-32-blackwell-both-valid.csv ../knn-32-blackwell.reference.csv log-scale_"
+
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-1024-hopper-both-valid.csv ../knn-1024-hopper.reference.csv log-scale_"
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-1024-ampere-both-valid.csv ../knn-1024-ampere.reference.csv log-scale_"
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-1024-volta-both-valid.csv ../knn-1024-volta.reference.csv log-scale_"
+    "knn@single-graph-style@no-paper-print@auto-boundaries@with-log-scale ./generated-data/knn-1024-blackwell-both-valid.csv ../knn-1024-blackwell.reference.csv log-scale_"
+
     # Graphs for the paper
 
     "hist@two-graphs-in-row-style@first-graph@with-log-scale ../histogram-loremipsum-hopper.csv ../histogram-loremipsum-hopper.reference.csv paper_"
@@ -80,6 +102,12 @@ args_per_graph=(
     "knn@two-graphs-in-row-style@first-graph@with-log-scale ../knn-32-blackwell.csv ../knn-32-blackwell.reference.csv paper_"
     "knn@two-graphs-in-row-style@second-graph@with-log-scale ../knn-1024-blackwell.csv ../knn-1024-blackwell.reference.csv paper_"
 
+    "knn@two-graphs-in-row-style@first-graph@with-log-scale ./generated-data/knn-32-hopper-both-valid.csv ../knn-32-hopper.reference.csv paper_both-valid_"
+    "knn@two-graphs-in-row-style@second-graph@with-log-scale ./generated-data/knn-1024-hopper-both-valid.csv ../knn-1024-hopper.reference.csv paper_both-valid_"
+
+    "knn@two-graphs-in-row-style@first-graph@with-log-scale ./generated-data/knn-32-blackwell-both-valid.csv ../knn-32-blackwell.reference.csv paper_both-valid_"
+    "knn@two-graphs-in-row-style@second-graph@with-log-scale ./generated-data/knn-1024-blackwell-both-valid.csv ../knn-1024-blackwell.reference.csv paper_both-valid_"
+
 
     "hist@two-graphs-in-row-style@first-graph@with-log-scale@narrow-hist ../histogram-loremipsum-hopper.csv ../histogram-loremipsum-hopper.reference.csv paper_narrow_"
     "hist@two-graphs-in-row-style@second-graph@with-log-scale@narrow-hist ../histogram-hexdump-hopper.csv ../histogram-hexdump-hopper.reference.csv paper_narrow_"
@@ -95,9 +123,19 @@ args_per_graph=(
 
     "knn@two-graphs-in-row-style@first-graph@with-log-scale@narrow-knn ../knn-32-blackwell.csv ../knn-32-blackwell.reference.csv paper_narrow_"
     "knn@two-graphs-in-row-style@second-graph@with-log-scale@narrow-knn ../knn-1024-blackwell.csv ../knn-1024-blackwell.reference.csv paper_narrow_"
+
+    "knn@two-graphs-in-row-style@first-graph@with-log-scale@narrow-knn ./generated-data/knn-32-hopper-both-valid.csv ../knn-32-hopper.reference.csv paper_narrow_both-valid_"
+    "knn@two-graphs-in-row-style@second-graph@with-log-scale@narrow-knn ./generated-data/knn-1024-hopper-both-valid.csv ../knn-1024-hopper.reference.csv paper_narrow_both-valid_"
+
+    "knn@two-graphs-in-row-style@first-graph@with-log-scale@narrow-knn ./generated-data/knn-32-blackwell-both-valid.csv ../knn-32-blackwell.reference.csv paper_narrow_both-valid_"
+    "knn@two-graphs-in-row-style@second-graph@with-log-scale@narrow-knn ./generated-data/knn-1024-blackwell-both-valid.csv ../knn-1024-blackwell.reference.csv paper_narrow_both-valid_"
 )
 
 echo "Printing graphs"
+echo
+
+echo "Preparing filtered k-NN CSVs"
+python3 "$filtered_knn_script" --input-dir "$script_dir" --output-dir "$filtered_knn_data_dir"
 echo
 
 echo "Setting up Python environment"
