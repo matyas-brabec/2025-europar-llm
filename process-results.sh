@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# This script processes the results of the experiments.
+# - Use gpt-querying/main.py to prepare batch files with LLM queries (results/gol-request.jsonl, results/knn-request.jsonl, results/histogram-request.jsonl).
+# - Run the batch files using the OpenAI web interface for batch processing (https://platform.openai.com/batches/).
+# - Download the results (results/gol-response.jsonl, results/knn-response.jsonl, results/histogram-response.jsonl).
+# - Run this script to process the results (parsing the responses, renaming files into expected names, doing trivial post-processing, etc.).
+
 set -euo pipefail
 
 mkdir -p results/gol results/knn results/histogram
