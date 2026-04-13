@@ -35,9 +35,11 @@ run:
 ${BUILD_DIR}/knn: compile
 
 compile: ${BUILD_DIR}/CMakeCache.txt
+	timeout 5m \
 	${CMAKE_COMMAND} --build "${BUILD_DIR}" --config "${BUILD_TYPE}" --parallel 4
 
 ${BUILD_DIR}/CMakeCache.txt:
+	timeout 1m \
 	${CMAKE_COMMAND} -S . -B "${BUILD_DIR}" ${CMAKE_FLAGS}
 
 clean:
