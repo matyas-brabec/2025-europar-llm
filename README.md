@@ -49,8 +49,8 @@ To navigate this repository more easily, here is an index:
 | 🔗 Open API | The code managing calls to OpenAI's ChatGPT is located in [~/gpt-querying](./gpt-querying/) along with a [README](./gpt-querying/README.md). |
 | ✍️ Single-Response Prompts | All prompts are in the [~/prompts](./prompts/) folder. Apart from the prompt files (`.prompt.md`), it also contains common parts that can be included in prompts. |
 | 🤖 Generated "Single-Response" Sources | Generated code in the *"Single-Response"* mode is in [~/results](./results/). Individual solutions for each prompt and its 10 attempts are in [~/results/histogram](./results/histogram/), [~/results/gol](./results/gol/), and [~/results/knn](./results/knn/). |
-| 🧐 Reviews | Code reviews for *"Single-Response"* generated code are in the [~/reviews](./reviews/) directory. |
-| 📊 Measurements | Code measurements for tested architectures (`Ampere`, `Volta`, and `Hopper`) are in [~/measured-times](./measured-times/). The format is CSV. For each architecture and problem, there are two CSVs: one for *"Single-Response"* codes, and one for reference solutions. The pre-generated graphs are located in [~/measured-times/graphs](./measured-times/graphs/). |
+| 🧐 Reviews | Code reviews for *"Single-Response"* generated code are in the [~/reviews](./reviews/) directory. Use [~/reviews/validate.py](./reviews/validate.py) to validate the review tables and reported summary rates against the Blackwell measurement CSVs. |
+| 📊 Measurements | Code measurements for tested architectures (`Ampere`, `Volta`, and `Hopper`) are in [~/measured-times](./measured-times/). The format is CSV. For each architecture and problem, there are two CSVs: one for *"Single-Response"* codes, and one for reference solutions. The pre-generated graphs are located in [~/measured-times/graphs](./measured-times/graphs/). Use [~/measured-times/resolve.py](./measured-times/resolve.py) to resolve job-ID CSVs from `framework/__log_dir__` into the canonical `measured-times/*.csv` names. |
 
 ## Tutorial 🚀
 
@@ -165,3 +165,8 @@ bash generate_all_graphs.sh
 ```
 
 This script generates all presented graphs (and some unused variants) from the CSV files in the `measured-times` directory and saves them in the `graphs` subdirectory.
+
+### Utility Scripts
+
+- To resolve raw `job-*.csv` and `.err` files from `framework/__log_dir__` into the canonical filenames in `measured-times`, run `python3 measured-times/resolve.py`. The script inspects only the first few data rows, supports dry-run by default, and can either move (`--apply`) or copy (`--copy`) the files.
+- To validate the review tables and the reported rates in `reviews/*.md`, run `python3 reviews/validate.py`. The script recomputes the status matrices and summary percentages from the Blackwell CSVs, checks the `🛠️` indicators against `/// @FIXED` markers in the generated sources, and fails if the markdown no longer matches the measurements.
