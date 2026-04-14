@@ -21,6 +21,8 @@ Run via the `main.py` file. Select the desired assignment by uncommenting the co
 The script can either generate the LLM response locally (via OpenAI API) or create a batch of requests.
 To obtain LLM responses for a batch, follow the [OpenAI guide](https://platform.openai.com/docs/guides/batch).
 
+After obtaining the LLM responses, run the `process-results.sh` script in the root of the repository to process the results (parsing the responses, renaming files into expected names, doing trivial post-processing, etc.).
+
 ## Code handling notes
 
 Sometimes, it was necessary to fix bugs in LLM-generated code. Each fixed bug (line or a small block) is labeled with a `@FIXED` annotation in doc-comment (prefixed with `///`), and the original is kept in a comment like this:
