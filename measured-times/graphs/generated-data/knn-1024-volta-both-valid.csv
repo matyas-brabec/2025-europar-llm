@@ -1,0 +1,5 @@
+experiment_id;time;std;compiled;verified;runtime_err;extra
+knn01-02/code;1943.34;1.07631;True;True;;
+knn01-03/code;1994.44;5.62439;True;True;;
+knn01-08/code;1987.46;0.540606;True;True;;
+knn01-10/code;1986.43;0.439133;True;True;;

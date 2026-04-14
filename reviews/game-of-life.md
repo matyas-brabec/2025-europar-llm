@@ -1,26 +1,26 @@
 # Game of Life
 
-This file contains an in-depth review of the "one-shot" generated solutions.
+This file contains an in-depth review of the single-response generated solutions.
 
 ## Correctness table
 
 | Test Case    | 01  | 02  | 03  | 04  | 05  | 06  | 07  | 08  | 09  | 10  |
 | ------------ | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GoL_01       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
-| GoL_02       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ❌   | ❌   | ✅   | ✅   |
-| GoL_02_tiled | ❌   | ❌   | ❌   | ❌   | ❌   | ✅   | ❌   | ❌   | ❌   | ❌   |
-| GoL_03       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ❌   |
-| GoL_04       | ✅   | ❌   | ✅   | ✅   | ✅   | ✅   | ❌   | ✅   | ✅   | ✅   |
-| GoL_05       | ✅   | ❌   | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   | ❌   | ✅   |
-| GoL_06       | ✅   | ❌   | ✅   | ✅   | ✅🛠️ | ✅   | ✅   | ✅   | ✅   | ✅   |
+| GoL_01       | ✅   | ✅   | ✅🛠️ | ✅   | ✅   | ✅🛠️ | ✅   | ✅   | ✅   | ✅   |
+| GoL_02       | ✅🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ❌🛠️ | ❌   | ✅   | ✅   |
+| GoL_02_tiled | ❌🛠️ | ❌🛠️ | ❌🛠️ | ❌   | ❌🛠️ | ✅🛠️ | ❌🛠️ | ❌🛠️ | ❌🛠️ | ❌   |
+| GoL_03       | ✅   | ✅🛠️ | ✅   | ✅   | ✅   | ✅   | ✅   | ✅🛠️ | ✅   | ❌🛠️ |
+| GoL_04       | ✅🛠️ | ❌🛠️ | ✅🛠️ | ✅   | ✅🛠️ | ✅   | ❌🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ |
+| GoL_05       | ✅🛠️ | ❌🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ✅🛠️ | ❌   | ✅🛠️ |
+| GoL_06       | ✅🛠️ | ❌🛠️ | ✅🛠️ | ✅   | ✅🛠️ | ✅   | ✅   | ✅🛠️ | ✅🛠️ | ✅   |
 
-✅ – Correct solution (compiled successfully and returned the correct GoL grid).
+✅ – Correct solution (compiled successfully and returned the correct GoL grid): 53/70 (76%)
 
-❌ – Compiled and ran without a runtime error but returned incorrect results.
+❌ – Compiled and ran without a runtime error but returned incorrect results: 17/70 (24%)
 
-❌💥 – Compiled but crashed during execution.
+❌💥 – Compiled but crashed during execution: 0/70 (0%)
 
-❌⚙️ – Did not compile.
+❌⚙️ – Did not compile: 0/70 (0%)
 
 ---
 
@@ -40,7 +40,7 @@ This file contains an in-depth review of the "one-shot" generated solutions.
 - 2D block
 - simple `if` for new state
 - solution with `__restrict__` - `01`, `04`, `05`, `06`, `07`, `09`, `10`
-  
+
 **Special features per solution:**
 
 - 03 ✅
@@ -76,21 +76,21 @@ On a positive note, all solutions compiled without issues, adhered to the reques
 
 ## Prompt 02
 
-**Common Features:**  
+**Common Features:**
 
-- **Block size** is `256`, with varying dimensions. The chosen block size is sensible, as testing has shown it to be a good choice. However, the shape varied significantly.  
-  - **Optimal choice:** A `32×8` block - one warp accesses memory in an aligned fashion while the rectangular shape improves caching efficiency.  
+- **Block size** is `256`, with varying dimensions. The chosen block size is sensible, as testing has shown it to be a good choice. However, the shape varied significantly.
+  - **Optimal choice:** A `32×8` block - one warp accesses memory in an aligned fashion while the rectangular shape improves caching efficiency.
     - *Used in:* `01`, `10`
-  - **Less optimal:** A `16×16` block - it disrupts aligned memory access.  
+  - **Less optimal:** A `16×16` block - it disrupts aligned memory access.
     - *Used in:* `02`,`03`,`05`,`06`,`07`
-  - **Worst choice:** A linear `256×1` block - no loaded words are reused within the block, making caching almost useless.  
+  - **Worst choice:** A linear `256×1` block - no loaded words are reused within the block, making caching almost useless.
     - *Used in:* `04`,`08`,`09`
 - Each CUDA thread processes one `64`-bit word.
 - Most solutions use the more efficient `if` condition (e.g., `(nb == 3) || (cell && (nb == 2))`), but none implement smarter techniques like lookup tables.
-- All solutions use bit masks and count neighbors bit by bit.  
+- All solutions use bit masks and count neighbors bit by bit.
 - Most solutions utilize `#pragma unroll`.
-- Two main variants of handling edge cases appeared:  
-  - One approach handled edge cases inside the loop.  
+- Two main variants of handling edge cases appeared:
+  - One approach handled edge cases inside the loop.
   - The other moved edge case handling outside the loop, which is more efficient as it eliminates two conditional checks each iteration.
   - **Unusual Variant:** Two solutions attempted a different approach (`05` and `06`): removing unused bits from the three left/right words and replacing them with bits from the respective central words. This method is quite clever, as it eliminates the need for special-case handling in the main loop. However, only one out of the two succeeded.
 
@@ -103,8 +103,8 @@ On a positive note, all solutions compiled without issues, adhered to the reques
 - 07 ❌
   - ❗tried creative edge case handling (as explained above)
   - the error is not immediately apparent—likely due to incorrect indexing
-- 08 ❌  
-  - ❗ Used a `C` array (i.e., `std::uint64_t nbr[3][3];`) but incorrectly applied it. All words were used in the computation of all bits, which is incorrect.  
+- 08 ❌
+  - ❗ Used a `C` array (i.e., `std::uint64_t nbr[3][3];`) but incorrectly applied it. All words were used in the computation of all bits, which is incorrect.
   - Good code style—made use of `const`.
 - 10 ✅
   - simple `if` for new state
@@ -145,9 +145,9 @@ In the promtt 4 there eas only one additional hint and that is the usage of `pop
 
 **Common Features:**
 
-We were surprised to see that, even when given explicit instructions to use the `popc` function for counting bits, most solutions ignored it entirely. Only cases `06`, `08` and `09` included a call to the function in the code. Interestingly, solutions `01`, `05`, and `07❌` mentioned the use of `popc` in comments but never actually implemented it in the code.  
+We were surprised to see that, even when given explicit instructions to use the `popc` function for counting bits, most solutions ignored it entirely. Only cases `06`, `08` and `09` included a call to the function in the code. Interestingly, solutions `01`, `05`, and `07❌` mentioned the use of `popc` in comments but never actually implemented it in the code.
 
-All other solutions followed the same techniques discussed previously in Prompt 2 and Prompt 3. As a result, we will not summarize these properties again and will instead focus on individual peculiarities in this test case.  
+All other solutions followed the same techniques discussed previously in Prompt 2 and Prompt 3. As a result, we will not summarize these properties again and will instead focus on individual peculiarities in this test case.
 
 **Special features per solution:**
 
@@ -174,11 +174,11 @@ All other solutions followed the same techniques discussed previously in Prompt 
   - `The __popc intrinsic is mentioned in the prompt to help with bit-counting.`
   - The solution acknowledges the hint but ignores it—at least it does not falsely claim at the beginning that it uses `popc`.
 - 06 ✅
-  - ❗ The solution uses `popc` to count neighbors; however, it does so in a suboptimal way. It still extracts bits one by one, but instead of adding them together using `+`, it combines them into a single `64`-bit word (using `or`). Then, it calls `popc` to count the bits. In this version, no instructions are saved.  
+  - ❗ The solution uses `popc` to count neighbors; however, it does so in a suboptimal way. It still extracts bits one by one, but instead of adding them together using `+`, it combines them into a single `64`-bit word (using `or`). Then, it calls `popc` to count the bits. In this version, no instructions are saved.
 - 07 ❌
   - `The __popc intrinsic was considered for fast bit–counting but`
   - Solution considered the usage of `popc` and decided not to use it.
-  - The code style is unusual—at some points, there are three nested `if` statements, making the solution hard to read. Additionally, there is an oddly nested `if` statement that could have been written as `else if`.  
+  - The code style is unusual—at some points, there are three nested `if` statements, making the solution hard to read. Additionally, there is an oddly nested `if` statement that could have been written as `else if`.
   ```c++
     if (...) {
       ...
@@ -186,7 +186,7 @@ All other solutions followed the same techniques discussed previously in Prompt 
         if (...) { ... }
     }
   ```
-  - The mistake is difficult to identify—once again, it appears to be a bad indexing issue, as the overall logic seems correct. However, due to poor code clarity, it is hard to be certain.  
+  - The mistake is difficult to identify—once again, it appears to be a bad indexing issue, as the overall logic seems correct. However, due to poor code clarity, it is hard to be certain.
 - 08 ✅
   - ❗ The solution uses `popc` but has the same issue as in case `06`.
 - 09 ✅
@@ -214,9 +214,9 @@ In this prompt, the hint provided was more of a suggestion than a precise instru
 **Special features per solution:**
 
 - 02 ❌
-  - ❗ Solution probably intended to use the unusual approach described in Prompt 2 but failed to correctly combine the left/right words with the center words.  
+  - ❗ Solution probably intended to use the unusual approach described in Prompt 2 but failed to correctly combine the left/right words with the center words.
 - 09 ❌
-  - ❗ Solution probably intended to use the unusual approach described in Prompt 2 but failed to correctly combine the left/right words with the center words.  
+  - ❗ Solution probably intended to use the unusual approach described in Prompt 2 but failed to correctly combine the left/right words with the center words.
 
 **Conclusion:** We observed a greater variety of solutions when the LLM was asked an open-ended question rather than given direct instructions. In addition to cases where it successfully discovered the optimal solution or failed to use the suggestion altogether, we also saw novel approaches that we had not anticipated. This is particularly interesting because it suggests that LLMs can be valuable not only for generating correct and fully functional code but also for providing innovative ideas. Even when these ideas are not executed to their full potential, they can still serve as inspiration for domain experts to refine and optimize further.
 
@@ -236,7 +236,7 @@ This time, the correct solutions utilized a `__device__` functions to simplify t
 - 03 ✅
   - ❗ No vectorization - bit by bit-masking solution. ("Unusual" approach as described in Prompt 2.)
 - 04 ✅
-  - ❗ No vectorization - bit by bit-masking solution. ("Unusual" approach as described in Prompt 2.)  
+  - ❗ No vectorization - bit by bit-masking solution. ("Unusual" approach as described in Prompt 2.)
 - 05 ✅🛠️
   - header of lambda did not compile: `[=, input] (int r, int w)`.
 - 06 ✅

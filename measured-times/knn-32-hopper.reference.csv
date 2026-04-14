@@ -1,0 +1,4 @@
+experiment_id;time;std;compiled;verified;runtime_err;extra
+baseline-warps/code;33.4187;0.0070795;True;True;;K=32
+baseline/code;29.6048;0.00846246;True;True;;K=32
+naive/code;569.183;0.0523634;True;True;;K=32
